@@ -1,0 +1,18 @@
+[project]
+name = "gnninversedesign"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "networkx>=3.6.1",
+    "scikit-learn>=1.8.0",
+    "torch>=2.11.0",
+    "torch-geometric>=2.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
