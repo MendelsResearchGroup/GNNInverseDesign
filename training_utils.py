@@ -1,9 +1,8 @@
 import itertools
 import os
-from typing import List, Optional, Protocol, Tuple
+from typing import Optional, Protocol
 
 import torch
-from sklearn.model_selection import train_test_split
 from torch import Tensor
 from torch_geometric.data import Data
 from tqdm import tqdm
