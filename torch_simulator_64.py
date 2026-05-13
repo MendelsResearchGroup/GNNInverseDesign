@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch_geometric.data import Data
 
-from utils import get_correct_edge_attr
+from graph_utils import get_correct_edge_attr
 
 
 class DifferentiableCompression64(nn.Module):

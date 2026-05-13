@@ -5,7 +5,8 @@ from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 
 from training_utils import ModelInputs
-from utils import build_mlp, get_correct_edge_vec
+from utils import build_mlp
+from graph_utils import get_correct_edge_vec
 
 
 class AxisSharedNodeEncoder(torch.nn.Module):

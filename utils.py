@@ -1,21 +1,100 @@
-import os
-import subprocess
 from itertools import batched
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import pandas as pd
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
-from torch_geometric.utils import degree, scatter
 
-from barostat_utils import estimate_initial_box_vel_y, estimate_initial_box_vel_y_accurate, update_box_y_thermodynamic
-from pressure import compute_per_particle_forces
+from barostat_utils import (
+    estimate_initial_box_vel_y,
+    estimate_initial_box_vel_y_accurate,
+    update_box_y_thermodynamic,
+)
+from graph_utils import get_correct_edge_attr
+from itpo_weights import DatasetType, ITPOWeights
+from pressure import (
+    compute_per_particle_forces,
+    compute_potential_energy,
+    compute_virial_stress,
+)
+from torch_simulator_64 import DifferentiableCompression64
 from training_utils import GNNModel, ModelInputs
 
 
 # Functions dealing with datasets
+def load_and_split_dataset(
+    registry_path: str,
+    target_data_type: DatasetType,
+    possion_buckets: list,
+    split_ratios: tuple = (0.6, 0.2, 0.2),
+    seed: int = 42
+):
+    if sum(split_ratios) != 1.0:
+        raise ValueError(f"expected `split_ratios` to sum up to 1.0, got {sum(split_ratios)}. ")
+        
+    df = pd.read_csv(registry_path)
+    
+    # Filter by data_type
+    data_type_map = {
+        DatasetType.NodeOptimized: "node_optimized",
+        DatasetType.StiffOptimized: "stiff_optimized"
+    }
+    type_df = df[df['data_type'] == data_type_map[target_data_type]]
+    
+    if type_df.empty:
+        raise ValueError(f"No data found for data_type: {data_type_map[target_data_type]}")
+
+    sampled_dfs = []
+
+    # Process each requested bucket
+    for i, bucket in enumerate(possion_buckets):
+        p_min = bucket.get('min', float('-inf'))
+        p_max = bucket.get('max', float('inf'))
+        req_count = bucket['count']
+
+        # Filter for the specific Poisson's ratio range (inclusive min, exclusive max)
+        bucket_df = type_df[(type_df['poisson_ratio'] >= p_min) & (type_df['poisson_ratio'] < p_max)]
+        
+        available = len(bucket_df)
+        if available == 0:
+            print(f"Warning: Bucket {i} ({p_min} <= P < {p_max}) is empty.")
+            continue
+            
+        if req_count > available:
+            print(f"Warning: Bucket {i} requested {req_count} but only has {available}. Taking all {available}.")
+            req_count = available
+            
+        # Sample the requested amount
+        sampled = bucket_df.sample(n=req_count, random_state=seed)
+        sampled_dfs.append(sampled)
+
+    if not sampled_dfs:
+        raise ValueError("No data was sampled from any bucket. Check threshold logic.")
+
+    # Combine all buckets into one grand dataset and shuffle it
+    combined_df = pd.concat(sampled_dfs)
+    combined_df = combined_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    # Calculate split indices
+    total_samples = len(combined_df)
+    train_end = int(total_samples * split_ratios[0])
+    val_end = train_end + int(total_samples * split_ratios[1])
+
+    # Slice the dataframe into train, val, test
+    train_df = combined_df.iloc[:train_end]
+    val_df = combined_df.iloc[train_end:val_end]
+    test_df = combined_df.iloc[val_end:]
+
+    # Extract file paths
+    def build_paths(subset_df):
+        return [fname for fname in subset_df['file_path']]
+
+    return build_paths(train_df), build_paths(val_df), build_paths(test_df)
+
+
 def split_sims(data: list[list[Data]], segment_length: int, step_limit: int) -> list[list[Data]]:
     """Batch simulations into tuples of n graphs.
     Preserves some time relations but makes it more random for training."""
@@ -27,56 +106,6 @@ def split_sims(data: list[list[Data]], segment_length: int, step_limit: int) -> 
 
 
 # Functions dealing with position graphs
-def get_correct_edge_vec(graph: Data, panic_at_nontensor_box: bool = False) -> Tensor:
-    pos = graph.x
-    col = graph.edge_index[0]
-    row = graph.edge_index[1]
-
-    # 1. ENSURE BOX IS TENSOR
-    # If we fall back to floats (else block), gradients for the box size DIE here.
-    if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, Tensor):
-        box_size = graph.box_tensor
-    else:
-        if panic_at_nontensor_box:
-            raise AttributeError("Graph does not have a tensor with box info.")
-        else:
-            box_size = torch.tensor([graph.box.x, graph.box.y], device=pos.device, dtype=pos.dtype)
-
-    # 2. Raw displacement
-    dr = pos[col] - pos[row]  # [E, 2]
-
-    # Ensure box_size broadcasts correctly [1, 2] against dr [E, 2]
-    box_tensor = box_size.view(1, 2)
-
-    dr_corrected = dr - torch.round(dr / box_tensor) * box_tensor
-
-    return dr_corrected
-
-
-def get_correct_edge_attr(graph: Data, recompute_stiff: bool, panic_at_nontensor_box: bool = False) -> Tensor:
-    """Compute correct edge attrbutes: edge vectors, edge lengths and bond stiffness."""
-
-    # 1. Get Differentiable Vectors
-    edge_vecs = get_correct_edge_vec(graph, panic_at_nontensor_box=panic_at_nontensor_box)
-
-    # 2. Compute Norm
-    edge_lengths = torch.norm(edge_vecs, dim=1)
-
-    # 3. Handle Stiffness
-    if recompute_stiff:
-        # If optimizing stiffness, this path is active.
-        stiff = 1.0 / edge_lengths
-    else:
-        # Note: If just optimizing positions, this passes the old constant stiffness.
-        # Ensure we don't accidentally detach if stiffness was meant to be learned.
-        stiff = graph.edge_attr[:, -1]
-
-    # 4. Stack
-    # Use column_stack or simple stack.
-    # Result shape: [E, 4] -> (dx, dy, length, k)
-    return torch.column_stack((edge_vecs, edge_lengths, stiff))
-
-
 def radius_graph(graph: Data, r: float) -> Tensor:
     G = nx.Graph()
     nodes = [(idx, {"pos": node}) for idx, node in enumerate(graph.x)]
@@ -375,7 +404,7 @@ def build_velocity_graph_correction(input_graphs: List[Data], total_velocity: bo
     )
 
 
-# One rollout function to rule them all
+# Rollout generation
 def get_rollout(
     input_graphs: List[Data],
     gnn_simulator: GNNModel,
@@ -510,6 +539,524 @@ def get_rollout(
         rollout.append(predicted_graph.cpu().detach())
 
     return rollout
+
+
+def simulate_then_rollout(
+    starting_graph: Data,
+    gnn_simulator: GNNModel,
+    gnn_history: int,
+    barostat_config: dict,
+    md_steps: int,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> List[Data]:
+    """Initial bootstrap trajectory is constructed via custom MD engine."""
+
+    num_particles = starting_graph.num_nodes
+    dt = barostat_config["dt"]
+    default_skip = barostat_config["default_skip"]
+    stride_dt = default_skip * dt
+    W_y = barostat_config["C_coupling"] * num_particles * (stride_dt**2)
+    damping = barostat_config["damping"] * num_particles * stride_dt
+
+    # MD trajectory
+    starting_graph = to_f64(starting_graph).to(device)
+    r0 = starting_graph.edge_attr[:, -2]
+    simulator: DifferentiableCompression64 = DifferentiableCompression64(
+        starting_graph.num_nodes,
+        factor_two=True,
+        temp_langevin=0.0
+    )
+    simulator_rollout, conditions = simulator.run_simulator(
+        initial_data=starting_graph,
+        steps=md_steps,
+        debug=False,
+        device=device,
+        r0=r0,
+    )
+
+    # GNN Simulator trajectory
+    indices = [i * default_skip for i in range(gnn_history + 1)]
+    input_graphs = [simulator_rollout[i] for i in indices]
+    input_graphs = [to_f32(g) for g in input_graphs]
+    for g in input_graphs:
+        g.pos = g.x
+
+    rollout = [g for g in input_graphs]
+
+    b0 = input_graphs[-2].box_tensor[0]
+    b1 = input_graphs[-1].box_tensor[0]
+    box_compression_factor = b1 / b0
+
+    if gnn_history >= 2:
+        current_box_vel_y = estimate_initial_box_vel_y_accurate(input_graphs[-3], input_graphs[-2], input_graphs[-1], stride_dt)
+    else:
+        current_box_vel_y = estimate_initial_box_vel_y(input_graphs[-2], input_graphs[-1], stride_dt)
+
+    for _ in range(rollout_steps + 1):
+        input_graph = build_velocity_graph_correction(rollout[-gnn_history - 1 :]).to(device)
+
+        model_output = gnn_simulator(input_graph, is_training=False)
+        update_inputs = ModelInputs(rollout[-2].to(device), rollout[-1].to(device), None)
+        predicted_graph = gnn_simulator.update(update_inputs, model_output)
+
+        # Scale box X
+        new_lx = predicted_graph.box_tensor[0] * box_compression_factor
+
+        # Update box Y
+        new_ly, new_vel_y = update_box_y_thermodynamic(
+            positions=predicted_graph.pos,
+            edge_index=update_inputs.cur_graph.edge_index,
+            edge_attr=update_inputs.cur_graph.edge_attr,
+            current_box=update_inputs.cur_graph.box_tensor,  # Use CURRENT box to calc pressure
+            r0=r0.float().to(predicted_graph.pos.device),
+            box_vel_y=current_box_vel_y,  # Use ESTIMATED velocity
+            W_y=W_y,
+            damping=damping,
+            stride_dt=default_skip * dt,
+            target_pressure=barostat_config["target_pressure"],
+            temperature=barostat_config["temperature"],
+        )
+
+        new_box_tensor = torch.stack([new_lx, new_ly])
+        current_box_vel_y = new_vel_y
+
+        # Apply to graph
+        predicted_graph.box_tensor = new_box_tensor
+        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+        predicted_graph.forces = compute_per_particle_forces(
+            predicted_graph,
+            r0=r0.float().to(predicted_graph.edge_attr.device),
+            panic_at_nontensor_box=True
+        )
+        rollout.append(predicted_graph)
+
+    return rollout
+
+
+def rollout_cascade(
+    models: List[GNNModel],
+    initial_state: Data,
+    num_steps: int,
+    barostat_config: dict,
+    box_compression_factor: float,
+    device: str = "cuda"
+) -> List[Data]:
+    """
+    A rollout function for simulator cascade.
+    """
+
+    # 1. Setup Barostat Parameters
+    num_particles = initial_state.num_nodes
+    r0 = initial_state.edge_attr[:, -2]
+    C_coupling = barostat_config["C_coupling"]
+    damping_coeff = barostat_config["damping"]
+    target_pressure = barostat_config["target_pressure"]
+    temperature = barostat_config["temperature"]
+    dt = barostat_config["dt"]
+    default_skip = barostat_config["default_skip"]
+    stride_dt = default_skip * dt
+    
+    W_y = C_coupling * num_particles * (stride_dt**2)
+    damping_params = damping_coeff * num_particles * stride_dt
+
+    # 2. Initialization
+    current_trajectory = [initial_state.to(device)]
+    
+    # We maintain the box velocity state across the rollout
+    current_box_vel_y = 0.0 
+    
+    # Ensure all models are in eval mode
+    for m in models:
+        m.eval()
+
+    # print(f"Starting rollout for {num_steps} steps...")
+
+    with torch.no_grad():
+        for step in range(num_steps):
+
+            # --- A. Model Selection Strategy ---
+            # If we have 1 frame of history, we must use h0 (index 0).
+            # If we have 2 frames, we can use h1 (index 1).
+            # We cap the index at the last available model.
+            
+            # current_history_len = len(current_trajectory)
+            # needed_index = current_history_len - 1 
+            # active_model_idx = min(needed_index, len(models) - 1)
+            
+            # Explicit logic for clarity:
+            history_len = len(current_trajectory)
+            if history_len <= len(models):
+                # Warmup phase: use the model corresponding to current history depth
+                active_model_idx = history_len - 1
+            else:
+                # Stable phase: use the most advanced model
+                active_model_idx = len(models) - 1
+            
+            active_model = models[active_model_idx]
+            
+            # --- B. Prepare Input ---
+            # We need to rebuild the graph edges based on the *latest* positions
+            input_graph = build_velocity_graph_correction(current_trajectory[-len(models)::], panic_at_positions=False).to(device)
+            
+            # Define "Previous" and "Current" frames for the ModelInputs wrapper
+            # If we only have 1 frame (start), prev and curr are the same.
+            prev_frame = current_trajectory[-2] if history_len > 1 else current_trajectory[-1]
+            curr_frame = current_trajectory[-1]
+            
+            model_inputs = ModelInputs(prev_frame, curr_frame, None)
+
+            # Predict
+            pred_delta = active_model(input_graph, is_training=False)
+
+            # Update graph
+            next_step_pred = active_model.update(model_inputs, pred_delta, recalc_edges=False)
+
+            # Update Box (Barostat)
+            new_box_tensor = next_step_pred.box_tensor.clone()
+            # Update Lx
+            new_box_tensor[0] = new_box_tensor[0] * box_compression_factor
+            
+            # Update Ly and and box velocity y
+            new_ly, new_vel_y = update_box_y_thermodynamic(
+                positions=next_step_pred.pos,
+                edge_index=model_inputs.cur_graph.edge_index,
+                edge_attr=model_inputs.cur_graph.edge_attr,
+                current_box=model_inputs.cur_graph.box_tensor,
+                r0=r0.float().to(next_step_pred.pos.device),
+                box_vel_y=current_box_vel_y,
+                W_y=W_y,
+                damping=damping_params,
+                stride_dt=stride_dt,
+                target_pressure=target_pressure,
+                temperature=temperature,
+            )
+            
+            new_box_tensor[1] = new_ly
+            current_box_vel_y = new_vel_y
+            
+            # Assign updated box to the prediction
+            next_step_pred.box_tensor = new_box_tensor
+
+            # Recompute edges
+            next_step_pred.edge_attr = get_correct_edge_attr(next_step_pred, recompute_stiff=False, panic_at_nontensor_box=True)
+
+            # Add to the rollout
+            current_trajectory.append(next_step_pred.detach())
+
+    return current_trajectory
+
+# Rollout generation with ITPO
+def compute_combined_physics_loss(graph: Data, r0: Tensor, target_Pyy: float = 0.0) -> Tuple[Tensor]:
+    # Potential energy
+    U = compute_potential_energy(graph, r0=r0.to(graph.x.device))
+
+    # 2. Per-particle Fy 
+    forces = compute_per_particle_forces(graph, r0=r0.to(graph.x.device), panic_at_nontensor_box=True)
+    force_y_mse = torch.mean(forces[:, 1].pow(2))
+
+    # 3. Virial pressure Pyy (should match target, which normally equals to 0.0)
+    stress_tensor = compute_virial_stress(graph, r0=r0.to(graph.x.device))
+    Pyy = stress_tensor[1]
+    stress_y_mse = (Pyy - target_Pyy).pow(2)
+
+    return U, force_y_mse, stress_y_mse
+
+
+def physical_inference_step(
+    model: GNNModel,
+    input_graph: Data,
+    model_inputs: ModelInputs,
+    barostat_config: dict,
+    box_compression_factor: float,
+    r0: Tensor,
+    current_box_vel_y: Tensor,
+    itpo_weights: ITPOWeights
+) -> Tuple[Data, Tensor]:
+
+    # Get current and previous graph
+    curr_graph = model_inputs.cur_graph
+    prev_graph = model_inputs.prev_graph
+
+    # Get all barostat-related parameters
+    num_particles = input_graph.num_nodes
+    dt = barostat_config["dt"]
+    default_skip = barostat_config["default_skip"]
+    stride_dt = default_skip * dt
+    W_y = barostat_config["C_coupling"] * num_particles * (stride_dt**2)
+    damping = barostat_config["damping"] * num_particles * stride_dt
+
+
+    # Forward
+    with torch.no_grad():
+        a_nn = model(input_graph)
+        a_nn = model.output_normalizer.inverse(a_nn)  # Real space accelerations
+
+    # Setup optimization on the predicted acceleration
+    a_refined = torch.nn.Parameter(a_nn.clone())
+
+    # Initialize optimizer
+    optimizer = torch.optim.Adam([a_refined], lr=itpo_weights.learning_rate)
+
+    def closure():
+        optimizer.zero_grad()
+
+        # Differentiable Forward Euler Integration
+        v_curr = curr_graph.x - prev_graph.x
+        v_next = v_curr + a_refined
+        x_next = curr_graph.x + v_next
+
+        # Construct new Data object
+        predicted_graph = Data(
+            x=x_next,
+            pos=x_next,
+            edge_index=curr_graph.edge_index,
+            edge_attr=curr_graph.edge_attr,
+            box=curr_graph.box if hasattr(curr_graph, "box") else None,
+            box_tensor=curr_graph.box_tensor if hasattr(curr_graph, "box_tensor") else None,
+        )
+
+        # Apply uniaxial compression
+        compressed_lx = predicted_graph.box_tensor[0] * box_compression_factor
+
+        # Get new Ly from barostat
+        compressed_ly, new_vel_y = update_box_y_thermodynamic(
+            positions=predicted_graph.pos,
+            edge_index=model_inputs.cur_graph.edge_index,
+            edge_attr=model_inputs.cur_graph.edge_attr,
+            current_box=model_inputs.cur_graph.box_tensor,  # Use CURRENT box to calc pressure
+            r0=r0.float().to(predicted_graph.pos.device),
+            box_vel_y=current_box_vel_y,  # Use ESTIMATED velocity
+            W_y=W_y,
+            damping=damping,
+            stride_dt=stride_dt,
+            target_pressure=barostat_config["target_pressure"],
+            temperature=barostat_config["temperature"],
+        )
+
+        new_box_tensor = torch.stack([compressed_lx, compressed_ly])
+
+        # Update graph with a new box
+        predicted_graph.box_tensor = new_box_tensor
+        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+
+        # Calculate Losses
+
+        # Anchor Loss
+        loss_anchor = torch.mean((a_refined - a_nn) ** 2)
+
+        # Physics Loss
+        energy_loss, force_loss, pressure_loss = compute_combined_physics_loss(predicted_graph, r0=r0, target_Pyy=0.0)
+        loss_physics = (
+            itpo_weights.lambda_energy * energy_loss + 
+            itpo_weights.lambda_force * force_loss + 
+            itpo_weights.lambda_pressure * pressure_loss
+        )
+
+        # Total loss
+        total_loss = loss_anchor + loss_physics
+
+        total_loss.backward()
+        return total_loss
+
+    # Optimization Loop
+    for _ in range(itpo_weights.refinement_iterations):
+        optimizer.step(closure)
+
+    # Final Forward Euler step
+    with torch.no_grad():
+        
+        # Final update
+        v_curr = curr_graph.x - prev_graph.x
+        v_next = v_curr + a_refined
+        x_next = curr_graph.x + v_next
+
+        # Construct final Data object
+        predicted_graph = Data(
+            x=x_next,
+            pos=x_next,
+            edge_index=curr_graph.edge_index,
+            edge_attr=curr_graph.edge_attr,
+            box=curr_graph.box if hasattr(curr_graph, "box") else None,
+            box_tensor=curr_graph.box_tensor if hasattr(curr_graph, "box_tensor") else None,
+        )
+
+        # Apply uniaxial compression
+        compressed_lx = predicted_graph.box_tensor[0] * box_compression_factor
+
+        # Get new Ly from barostat
+        compressed_ly, new_vel_y = update_box_y_thermodynamic(
+            positions=predicted_graph.pos,
+            edge_index=model_inputs.cur_graph.edge_index,
+            edge_attr=model_inputs.cur_graph.edge_attr,
+            current_box=model_inputs.cur_graph.box_tensor,  # Use CURRENT box to calc pressure
+            r0=r0.float().to(predicted_graph.pos.device),
+            box_vel_y=current_box_vel_y,  # Use ESTIMATED velocity
+            W_y=W_y,
+            damping=damping,
+            stride_dt=stride_dt,
+            target_pressure=barostat_config["target_pressure"],
+            temperature=barostat_config["temperature"],
+        )
+
+        new_box_tensor = torch.stack([compressed_lx, compressed_ly])
+
+        # Update graph with a new box
+        predicted_graph.box_tensor = new_box_tensor
+        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+
+    return predicted_graph.detach(), new_vel_y.detach()
+
+
+def specialized_rollout(
+    starting_graph: Data,
+    gnn_simulator: GNNModel,
+    gnn_history: int,
+    barostat_config: dict,
+    itpo_weights: ITPOWeights,
+    md_steps: int,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> List[Data]:
+    
+    r0 = starting_graph.edge_attr[:, -2]
+    default_skip = barostat_config["default_skip"]
+    dt = barostat_config["dt"]
+    stride_dt = default_skip * dt
+
+    # Bootstrap with torch_simulator64
+    starting_graph = to_f64(starting_graph).cuda()
+    simulator: DifferentiableCompression64 = DifferentiableCompression64(starting_graph.num_nodes, factor_two=True, temp_langevin=0.0)
+    simulator_rollout, conditions = simulator.run_simulator(
+        starting_graph,
+        md_steps,
+        debug=False,
+        device=device,
+        r0=r0.to(device),
+    )
+
+    # GNN Simulator trajectory
+    indices = [i * default_skip for i in range(gnn_history + 1)]
+    raw_input_graphs = [simulator_rollout[i] for i in indices]
+
+    input_graphs = []
+    for g in raw_input_graphs:
+        
+        # Convert to f32
+        clean_g = to_f32(g)
+        
+        g.pos = g.x
+
+        # Explicitly detach all tensors to kill the upstream graph
+        clean_g.x = clean_g.x.detach()
+        
+        if hasattr(clean_g, 'pos') and clean_g.pos is not None:
+            clean_g.pos = clean_g.pos.detach()
+        else:
+            clean_g.pos = clean_g.x 
+            
+        if hasattr(clean_g, 'box_tensor') and clean_g.box_tensor is not None:
+            clean_g.box_tensor = clean_g.box_tensor.detach()
+            
+        if hasattr(clean_g, 'edge_attr') and clean_g.edge_attr is not None:
+            clean_g.edge_attr = clean_g.edge_attr.detach()
+            
+        if hasattr(clean_g, 'edge_index') and clean_g.edge_index is not None:
+            clean_g.edge_index = clean_g.edge_index.detach()
+            
+        input_graphs.append(clean_g)
+
+    rollout = [g for g in input_graphs]
+
+    b0 = input_graphs[-2].box_tensor[0]
+    b1 = input_graphs[-1].box_tensor[0]
+    box_compression_factor = b1 / b0
+
+    if gnn_history >= 2:
+        current_box_vel_y = estimate_initial_box_vel_y_accurate(input_graphs[-3], input_graphs[-2], input_graphs[-1], stride_dt)
+    else:
+        current_box_vel_y = estimate_initial_box_vel_y(input_graphs[-2], input_graphs[-1], stride_dt)
+
+    for _ in range(rollout_steps + 1):
+        input_graph = build_velocity_graph_correction(rollout[-gnn_history - 1 :]).to(device)
+        model_inputs = ModelInputs(rollout[-2].to(device), rollout[-1].to(device), None)
+        
+        predicted_graph, current_box_vel_y = physical_inference_step(
+            model=gnn_simulator,
+            input_graph=input_graph,
+            model_inputs=model_inputs,
+            barostat_config=barostat_config,
+            box_compression_factor=box_compression_factor,
+            r0=r0.float(),
+            current_box_vel_y=current_box_vel_y,
+            itpo_weights=itpo_weights,
+        )
+
+        rollout.append(predicted_graph)
+    return rollout
+
+
+def specialized_rollout_cascade(
+    starting_graph: Data,
+    gnn_models: List[GNNModel],
+    barostat_config: dict,
+    box_compression_factor: float,
+    itpo_weights: ITPOWeights,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> List[Data]:
+    for m in gnn_models:
+        m.eval()
+
+    r0 = starting_graph.edge_attr[:, -2]
+
+    rollout = [starting_graph.to(device)]
+    current_box_vel_y = 0.0 
+    
+    for _ in range(rollout_steps + 1):
+
+        # Pick active model based on existing frames
+        history_len = len(rollout)
+        if history_len <= len(gnn_models):
+            # Warmup phase: use the model corresponding to current history depth
+            active_model_idx = history_len - 1
+        else:
+            # Stable phase: use the most advanced model
+            active_model_idx = len(gnn_models) - 1        
+        active_model = gnn_models[active_model_idx]
+        
+        input_graph = build_velocity_graph_correction(
+            rollout[-len(gnn_models)::],
+            panic_at_positions=False,
+            total_velocity=False,
+        ).to(device)
+        
+        prev_graph = rollout[-2] if history_len > 1 else rollout[-1]
+        curr_graph = rollout[-1]
+        
+        model_inputs = ModelInputs(
+            prev_graph,
+            curr_graph,
+            None
+        )
+        
+        predicted_graph, current_box_vel_y = physical_inference_step(
+            model=active_model,
+            input_graph=input_graph,
+            model_inputs=model_inputs,
+            barostat_config=barostat_config,
+            box_compression_factor=box_compression_factor,
+            r0=r0,
+            current_box_vel_y=current_box_vel_y,
+            itpo_weights=itpo_weights
+        )
+
+        rollout.append(predicted_graph.detach())
+    
+    return rollout
+
+
+
 
 
 # Calculate Poisson ratio

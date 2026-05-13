@@ -14,6 +14,56 @@ def filter_directed(edge_index: Tensor) -> Tensor:
         return edge_index[0] < edge_index[1]
 
 
+def get_correct_edge_vec(graph: Data, panic_at_nontensor_box: bool = False) -> Tensor:
+    pos = graph.x
+    col = graph.edge_index[0]
+    row = graph.edge_index[1]
+
+    # 1. ENSURE BOX IS TENSOR
+    # If we fall back to floats (else block), gradients for the box size DIE here.
+    if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, Tensor):
+        box_size = graph.box_tensor
+    else:
+        if panic_at_nontensor_box:
+            raise AttributeError("Graph does not have a tensor with box info.")
+        else:
+            box_size = torch.tensor([graph.box.x, graph.box.y], device=pos.device, dtype=pos.dtype)
+
+    # 2. Raw displacement
+    dr = pos[col] - pos[row]  # [E, 2]
+
+    # Ensure box_size broadcasts correctly [1, 2] against dr [E, 2]
+    box_tensor = box_size.view(1, 2)
+
+    dr_corrected = dr - torch.round(dr / box_tensor) * box_tensor
+
+    return dr_corrected
+
+
+def get_correct_edge_attr(graph: Data, recompute_stiff: bool, panic_at_nontensor_box: bool = False) -> Tensor:
+    """Compute correct edge attrbutes: edge vectors, edge lengths and bond stiffness."""
+
+    # 1. Get Differentiable Vectors
+    edge_vecs = get_correct_edge_vec(graph, panic_at_nontensor_box=panic_at_nontensor_box)
+
+    # 2. Compute Norm
+    edge_lengths = torch.norm(edge_vecs, dim=1)
+
+    # 3. Handle Stiffness
+    if recompute_stiff:
+        # If optimizing stiffness, this path is active.
+        stiff = 1.0 / edge_lengths
+    else:
+        # Note: If just optimizing positions, this passes the old constant stiffness.
+        # Ensure we don't accidentally detach if stiffness was meant to be learned.
+        stiff = graph.edge_attr[:, -1]
+
+    # 4. Stack
+    # Use column_stack or simple stack.
+    # Result shape: [E, 4] -> (dx, dy, length, k)
+    return torch.column_stack((edge_vecs, edge_lengths, stiff))
+
+
 def to_directed_graph(graph: Data) -> Data:
 
     edge_index = graph.edge_index
