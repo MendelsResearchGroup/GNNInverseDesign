@@ -7,6 +7,7 @@ from torch_geometric.utils import is_undirected, to_undirected
 
 
 def filter_directed(edge_index: Tensor) -> Tensor:
+    
     # Return edge index if its directed already
     if not is_undirected(edge_index):
         return torch.ones_like(edge_index[0]).bool()
@@ -19,8 +20,7 @@ def get_correct_edge_vec(graph: Data, panic_at_nontensor_box: bool = False) -> T
     col = graph.edge_index[0]
     row = graph.edge_index[1]
 
-    # 1. ENSURE BOX IS TENSOR
-    # If we fall back to floats (else block), gradients for the box size DIE here.
+    # Ensure we have box as tensor
     if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, Tensor):
         box_size = graph.box_tensor
     else:
@@ -29,7 +29,7 @@ def get_correct_edge_vec(graph: Data, panic_at_nontensor_box: bool = False) -> T
         else:
             box_size = torch.tensor([graph.box.x, graph.box.y], device=pos.device, dtype=pos.dtype)
 
-    # 2. Raw displacement
+    # Raw displacement
     dr = pos[col] - pos[row]  # [E, 2]
 
     # Ensure box_size broadcasts correctly [1, 2] against dr [E, 2]
@@ -41,26 +41,20 @@ def get_correct_edge_vec(graph: Data, panic_at_nontensor_box: bool = False) -> T
 
 
 def get_correct_edge_attr(graph: Data, recompute_stiff: bool, panic_at_nontensor_box: bool = False) -> Tensor:
-    """Compute correct edge attrbutes: edge vectors, edge lengths and bond stiffness."""
-
-    # 1. Get Differentiable Vectors
+    # Get edge vec
     edge_vecs = get_correct_edge_vec(graph, panic_at_nontensor_box=panic_at_nontensor_box)
 
-    # 2. Compute Norm
+    # Compute edge len
     edge_lengths = torch.norm(edge_vecs, dim=1)
 
-    # 3. Handle Stiffness
+    # Handle Stiffness
     if recompute_stiff:
-        # If optimizing stiffness, this path is active.
+        # Only work for node-optimized networks
         stiff = 1.0 / edge_lengths
     else:
-        # Note: If just optimizing positions, this passes the old constant stiffness.
-        # Ensure we don't accidentally detach if stiffness was meant to be learned.
+        # If anything changed, stiffness needs to be updated manually later
         stiff = graph.edge_attr[:, -1]
 
-    # 4. Stack
-    # Use column_stack or simple stack.
-    # Result shape: [E, 4] -> (dx, dy, length, k)
     return torch.column_stack((edge_vecs, edge_lengths, stiff))
 
 
@@ -102,6 +96,7 @@ def compute_angle_indices(edge_index: Tensor) -> Tensor:
     Finds all triplets (i, j, k) such that j is connected to i and k.
     Returns tensor of shape [3, Num_Angles]
     """
+    
     # Convert edge_index to adjacency list format for fast lookup
     src, dst = edge_index
     idx = torch.argsort(src)

@@ -38,14 +38,10 @@ def load_and_split_dataset(
     df = pd.read_csv(registry_path)
     
     # Filter by data_type
-    data_type_map = {
-        DatasetType.NodeOptimized: "node_optimized",
-        DatasetType.StiffOptimized: "stiff_optimized"
-    }
-    type_df = df[df['data_type'] == data_type_map[target_data_type]]
+    type_df = df[df['data_type'] == str(target_data_type)]
     
     if type_df.empty:
-        raise ValueError(f"No data found for data_type: {data_type_map[target_data_type]}")
+        raise ValueError(f"No data found for data_type: {str(target_data_type)}")
 
     sampled_dfs = []
 
@@ -646,7 +642,7 @@ def rollout_cascade(
     A rollout function for simulator cascade.
     """
 
-    # 1. Setup Barostat Parameters
+    # Setup Barostat Parameters
     num_particles = initial_state.num_nodes
     r0 = initial_state.edge_attr[:, -2]
     C_coupling = barostat_config["C_coupling"]
@@ -660,7 +656,7 @@ def rollout_cascade(
     W_y = C_coupling * num_particles * (stride_dt**2)
     damping_params = damping_coeff * num_particles * stride_dt
 
-    # 2. Initialization
+    # Trajectory initialization
     current_trajectory = [initial_state.to(device)]
     
     # We maintain the box velocity state across the rollout
@@ -670,21 +666,11 @@ def rollout_cascade(
     for m in models:
         m.eval()
 
-    # print(f"Starting rollout for {num_steps} steps...")
 
     with torch.no_grad():
         for step in range(num_steps):
-
-            # --- A. Model Selection Strategy ---
-            # If we have 1 frame of history, we must use h0 (index 0).
-            # If we have 2 frames, we can use h1 (index 1).
-            # We cap the index at the last available model.
             
-            # current_history_len = len(current_trajectory)
-            # needed_index = current_history_len - 1 
-            # active_model_idx = min(needed_index, len(models) - 1)
-            
-            # Explicit logic for clarity:
+            # Model selection
             history_len = len(current_trajectory)
             if history_len <= len(models):
                 # Warmup phase: use the model corresponding to current history depth
@@ -695,8 +681,7 @@ def rollout_cascade(
             
             active_model = models[active_model_idx]
             
-            # --- B. Prepare Input ---
-            # We need to rebuild the graph edges based on the *latest* positions
+            # Construct input graph
             input_graph = build_velocity_graph_correction(current_trajectory[-len(models)::], panic_at_positions=False).to(device)
             
             # Define "Previous" and "Current" frames for the ModelInputs wrapper
@@ -706,10 +691,10 @@ def rollout_cascade(
             
             model_inputs = ModelInputs(prev_frame, curr_frame, None)
 
-            # Predict
+            # Forward
             pred_delta = active_model(input_graph, is_training=False)
 
-            # Update graph
+            # Update next state
             next_step_pred = active_model.update(model_inputs, pred_delta, recalc_edges=False)
 
             # Update Box (Barostat)
@@ -751,11 +736,11 @@ def compute_combined_physics_loss(graph: Data, r0: Tensor, target_Pyy: float = 0
     # Potential energy
     U = compute_potential_energy(graph, r0=r0.to(graph.x.device))
 
-    # 2. Per-particle Fy 
+    # Per-particle Fy 
     forces = compute_per_particle_forces(graph, r0=r0.to(graph.x.device), panic_at_nontensor_box=True)
     force_y_mse = torch.mean(forces[:, 1].pow(2))
 
-    # 3. Virial pressure Pyy (should match target, which normally equals to 0.0)
+    # Virial pressure Pyy (should match target, which normally equals to 0.0)
     stress_tensor = compute_virial_stress(graph, r0=r0.to(graph.x.device))
     Pyy = stress_tensor[1]
     stress_y_mse = (Pyy - target_Pyy).pow(2)
@@ -1056,15 +1041,19 @@ def specialized_rollout_cascade(
     return rollout
 
 
-
-
-
 # Calculate Poisson ratio
 def calc_p_ratio_box_tensor(trajectory: list[Data], last_index: int = -1) -> Tensor:
     if hasattr(trajectory[0], "box_tensor") and isinstance(trajectory[0].box_tensor, Tensor):
-        denom = trajectory[last_index].box_tensor[0] - trajectory[0].box_tensor[0]
-        num = trajectory[last_index].box_tensor[1] - trajectory[0].box_tensor[1]
-        return -(num) / (denom + 1e-8)
+        
+        # Correct calculation
+        strain_x = (trajectory[last_index].box_tensor[0] - trajectory[0].box_tensor[0]) / trajectory[0].box_tensor[0]
+        strain_y = (trajectory[last_index].box_tensor[1] - trajectory[0].box_tensor[1]) / trajectory[0].box_tensor[1]
+        return -strain_y / (strain_x + 1e-8)
+        
+        # Naive calculation (works because square initial box)
+        dx = trajectory[last_index].box_tensor[0] - trajectory[0].box_tensor[0]
+        dy = trajectory[last_index].box_tensor[1] - trajectory[0].box_tensor[1]
+        return -dy / (dx + 1e-8)
     else:
         raise AttributeError("No box tensor.")
 
@@ -1081,7 +1070,9 @@ def calc_p_ratio_box(simulation: list[Data], index: int = -1) -> float:
     float
         Poisson ratio
     """
-    return -(simulation[index].box.y - simulation[0].box.y) / (simulation[index].box.x - simulation[0].box.x)
+    strain_x = (simulation[index].box.x - simulation[0].box.x) / simulation[0].box.x
+    strain_y = (simulation[index].box.y - simulation[0].box.y) / simulation[0].box.y
+    return -strain_y / strain_x
 
 
 # Changing floating point precision

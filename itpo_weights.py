@@ -11,6 +11,12 @@ class DatasetType(Enum):
     NodeOptimized = auto()
     StiffOptimized = auto()
 
+    def __str__(self):
+            mapping = {
+                DatasetType.NodeOptimized: "node_optimized",
+                DatasetType.StiffOptimized: "stiff_optimized",
+            }
+            return mapping[self]
 
 @dataclass
 class ITPOWeights:

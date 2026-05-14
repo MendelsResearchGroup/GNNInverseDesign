@@ -10,3 +10,5 @@ wheels/
 .venv
 .vscode/settings.json
 demo_data
+data
+data_mini

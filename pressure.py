@@ -76,7 +76,7 @@ def compute_total_stress(graph: Data, r0: Tensor, temperature: float = 1e-7):
     p_v_xx = 0.5 * torch.sum(ratio * r_vec[:, 0] ** 2) / area
     p_v_yy = 0.5 * torch.sum(ratio * r_vec[:, 1] ** 2) / area
 
-    # 3. Kinetic Term
+    # Kinetic Term
     p_kinetic = (pos.shape[0] * KB_METAL * temperature) / area
 
     return torch.stack([p_v_xx + p_kinetic, p_v_yy + p_kinetic])
