@@ -4,9 +4,9 @@ from torch.nn import ModuleList
 from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 
+from graph_utils import get_correct_edge_vec
 from training_utils import ModelInputs
 from utils import build_mlp
-from graph_utils import get_correct_edge_vec
 
 
 class AxisSharedNodeEncoder(torch.nn.Module):
@@ -20,7 +20,6 @@ class AxisSharedNodeEncoder(torch.nn.Module):
         self.axis_mlp = build_mlp(num_history_steps, hidden_dim, hidden_dim, num_mlp=num_mlp, lay_norm=False)
 
     def forward(self, x: Tensor) -> Tensor:
-
         x_reshaped = x.view(x.size(0), 2, -1)
         encoded = self.axis_mlp(x_reshaped)
         return encoded.view(x.size(0), -1)
@@ -31,7 +30,11 @@ class Encoder(torch.nn.Module):
         super().__init__()
 
         self.num_history_steps = data.num_features // 2
-        self.shared_node_encoder = AxisSharedNodeEncoder(num_history_steps=self.num_history_steps, hidden_dim=hidden_size, num_mlp=num_mlp)
+        self.shared_node_encoder = AxisSharedNodeEncoder(
+            num_history_steps=self.num_history_steps,
+            hidden_dim=hidden_size,
+            num_mlp=num_mlp,
+        )
         self.node_projection = torch.nn.Linear(hidden_size * 2, hidden_size)
         self.edge_encoder = build_mlp(
             data.num_edge_features,
@@ -222,31 +225,9 @@ class Model(torch.nn.Module):
             edge_index=inputs.cur_graph.edge_index,
             edge_attr=inputs.cur_graph.edge_attr,
             box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            box_tensor=inputs.cur_graph.box_tensor if hasattr(inputs.cur_graph, "box_tensor") else None,
-        )
-
-    def velocity_update(self, inputs: ModelInputs, model_output: Tensor) -> Data:
-        predicted_displacement = model_output
-        predicted_displacement = self.output_normalizer.inverse(predicted_displacement)
-        predicted_position = inputs.cur_position + predicted_displacement
-
-        tmp = Data(
-            x=predicted_position,
-            edge_index=inputs.cur_graph.edge_index,
-            edge_attr=inputs.cur_graph.edge_attr,
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            box_tensor=inputs.cur_graph.box_tensor if hasattr(inputs.cur_graph, "box_tensor") else None,
-        )
-
-        new_edge_attr = self._recalc_edges(tmp)
-
-        return Data(
-            x=predicted_position,
-            pos=predicted_position,
-            edge_index=inputs.cur_graph.edge_index,
-            edge_attr=new_edge_attr,
-            box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-            box_tensor=inputs.cur_graph.box_tensor if hasattr(inputs.cur_graph, "box_tensor") else None,
+            box_tensor=inputs.cur_graph.box_tensor
+            if hasattr(inputs.cur_graph, "box_tensor")
+            else None,
         )
 
     def loss(self, model_output: Tensor, inputs: ModelInputs, is_training: bool = True) -> Tensor:
@@ -257,13 +238,6 @@ class Model(torch.nn.Module):
         target_velocity_change_normalized = self.output_normalizer(target_velocity_change, is_training=is_training, accumulate=is_training)
         acceleration_loss = torch.nn.functional.mse_loss(predicted_velocity_change, target_velocity_change_normalized)
         return acceleration_loss
-
-    def velocity_loss(self, model_output: Tensor, inputs: ModelInputs, is_training: bool = True) -> Tensor:
-        predicted_displacement = model_output
-        target_displacement = inputs.target_position - inputs.cur_position
-        target_displacement_normalized = self.output_normalizer(target_displacement, is_training=is_training, accumulate=is_training)
-        velocity_loss = torch.nn.functional.mse_loss(predicted_displacement, target_displacement_normalized)
-        return velocity_loss
 
     def save_checkpoint(self, savedir: str):
         model = self.state_dict()
