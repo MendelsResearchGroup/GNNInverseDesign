@@ -69,7 +69,8 @@ def update_box_y_thermodynamic(
     new_box_vel_y = box_vel_y + box_acc * stride_dt
 
     # L_new = L_old * exp(v * dt)
-    new_ly = ly * torch.exp(new_box_vel_y * stride_dt)
+    # new_ly = ly * torch.exp(new_box_vel_y * stride_dt)
+    new_ly = ly + (new_box_vel_y * stride_dt)
 
     return new_ly, new_box_vel_y
 
@@ -78,7 +79,8 @@ def estimate_initial_box_vel_y(prev_graph: Data, curr_graph: Data, stride_dt: fl
     ly_p = prev_graph.box_tensor[1]
     ly_c = curr_graph.box_tensor[1]
 
-    box_vel_y = torch.log(ly_c / ly_p) / stride_dt
+    # v(t) approx (L_c - L_p) / dt
+    box_vel_y = (ly_c - ly_p) / stride_dt
 
     return box_vel_y
 
@@ -88,11 +90,7 @@ def estimate_initial_box_vel_y_accurate(prev_prev_graph: Data, prev_graph: Data,
     ly_p = prev_graph.box_tensor[1]
     ly_c = curr_graph.box_tensor[1]
 
-    # v(t) approx [3*ln(L_t) - 4*ln(L_t-1) + ln(L_t-2)] / (2*dt)
-    log_c = torch.log(ly_c)
-    log_p = torch.log(ly_p)
-    log_pp = torch.log(ly_pp)
-
-    box_vel_y = (3 * log_c - 4 * log_p + log_pp) / (2 * stride_dt)
+    # v(t) approx [3*L_t - 4*L_{t-1} + L_{t-2}] / (2*dt)
+    box_vel_y = (3 * ly_c - 4 * ly_p + ly_pp) / (2 * stride_dt)
     
     return box_vel_y
