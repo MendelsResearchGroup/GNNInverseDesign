@@ -12,3 +12,6 @@ wheels/
 demo_data
 data
 data_mini
+
+
+trained_models/
