@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List
 
 import pandas as pd
 import torch
@@ -40,7 +39,7 @@ def get_sampled_files_with_labels(
     type_df = df[df["data_type"] == str(target_data_type)]
 
     if type_df.empty:
-        raise ValueError(f"No data found for data_type: {str(target_data_type)}")
+        raise ValueError(f"No data found for data_type: {target_data_type!s}")
 
     sampled_dfs = []
 
@@ -58,8 +57,7 @@ def get_sampled_files_with_labels(
             logger.warning(f"Bucket {i} ({p_min} <= P < {p_max}) is empty.")
             continue
 
-        if req_count > available:
-            req_count = available
+        req_count = min(req_count, available)
 
         sampled = bucket_df.sample(n=req_count, random_state=seed)
 
@@ -79,13 +77,13 @@ def get_sampled_files_with_labels(
 
 
 def train_model_once_mst(
-    data: dict[str, List],
+    data: dict[str, list],
     model: VelocityModel,
     epochs: int,
-    barostat_config: Dict,
+    barostat_config: dict,
     save_dir: str,
     device: str = "cuda",
-) -> Dict:
+) -> dict:
 
     freeze_norm_epoch = 5
     train_sims = 200
@@ -174,7 +172,7 @@ def train_model_once_mst(
                         dump_period * barostat_config["dt"],
                     )
                 else:
-                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")
+                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")  # noqa: TRY002
 
                 rollout_loss = 0
                 for step in range(rollout_steps):
@@ -356,7 +354,7 @@ if __name__ == "__main__":
     )
 
     # 2. Pre-load ALL data into memory exactly ONCE
-    logging.info(f"Pre-loading {len(all_files)} simulations into memory...")
+    logging.info(f"Pre-loading {len(all_files)} simulations into memory...")  # noqa: LOG015
     max_sim_len = 100
     master_dataset = []
 
@@ -384,7 +382,7 @@ if __name__ == "__main__":
             "val": [master_dataset[i] for i in val_idx],
         }
 
-        logging.info(f"Loaded {len(data['train'])} training and {len(data['val'])} validation simulations.")
+        logging.info(f"Loaded {len(data['train'])} training and {len(data['val'])} validation simulations.")  # noqa: LOG015
 
         # Optional check: verify that the proportion of buckets in data['val'] remains uniform
         val_labels_in_fold = [bucket_labels[i] for i in val_idx]

@@ -21,8 +21,6 @@ from pressure import (
     compute_potential_energy,
     compute_virial_stress,
 )
-
-# from torch_simulator_64 import DifferentiableCompression64
 from torch_simulator_wLJ_64 import DifferentiableCompression64
 from training_utils import GNNModel, ModelInputs
 
@@ -636,9 +634,7 @@ def get_rollout(
         W_y = C_coupling * num_particles * (stride_dt**2)
         damping = damping_coeff * num_particles * stride_dt
 
-    rollout = []
-    for graph in input_graphs:
-        rollout.append(graph)
+    rollout = list.copy(input_graphs)
 
     # Calculate box compression factor
     b0 = input_graphs[-2].box_tensor[0]

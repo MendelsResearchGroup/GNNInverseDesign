@@ -1,6 +1,6 @@
 import itertools
 import os
-from typing import Optional, Protocol
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -71,7 +71,7 @@ def load_data_from_paths(
     n_finetune: int = 0,
     n_test: int = 50,
     n_val: int = 0,
-    max_sim_length: Optional[int] = None
+    max_sim_length: int | None = None
 ) -> dict:
     
     file_maps = {

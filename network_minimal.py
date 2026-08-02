@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 class Box:
     x1: float
     x2: float

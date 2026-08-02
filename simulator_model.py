@@ -59,7 +59,7 @@ class Encoder(torch.nn.Module):
 
 class CustomMessagePassing(MessagePassing):
     def __init__(self, hidden_size: int, num_mlp: int):
-        super(CustomMessagePassing, self).__init__(aggr="add")
+        super().__init__(aggr="add")
         self.node_layer = build_mlp(hidden_size * 4, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=True)
         self.edge_layer = build_mlp(
             hidden_size * 3,
@@ -109,7 +109,7 @@ class Normalizer(torch.nn.Module):
         name="Normalizer",
         device="cuda",
     ):
-        super(Normalizer, self).__init__()
+        super().__init__()
         self.frozen = False
         self.name = name
         self._max_accumulations = max_accumulations
@@ -120,8 +120,7 @@ class Normalizer(torch.nn.Module):
         self._acc_sum_squared = torch.zeros((1, size), dtype=torch.float, requires_grad=False, device=device)
 
     def forward(self, data: Tensor, accumulate=True, is_training: bool = True):
-        if accumulate and is_training and not self.frozen:
-            if self._num_accumulations < self._max_accumulations:
+        if accumulate and is_training and not self.frozen and self._num_accumulations < self._max_accumulations:
                 self._accumulate(data.detach())
         return (data - self._mean()) / self._std_with_epsilon()
 

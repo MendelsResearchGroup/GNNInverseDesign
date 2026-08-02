@@ -2,7 +2,6 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Tuple
 
 import torch
 from sklearn.metrics import r2_score
@@ -30,14 +29,14 @@ from utils import (
 
 
 def train_model_once_mst(
-    data: dict[str, List],
+    data: dict[str, list],
     model: VelocityModel,
     epochs: int,
-    barostat_config: Dict,
+    barostat_config: dict,
     lj_params: LJInteractionParams,
     save_dir: str,
     device: str,
-) -> Dict:
+) -> dict:
 
     freeze_norm_epoch = 5
     train_sims = 200
@@ -134,7 +133,7 @@ def train_model_once_mst(
                         dump_period * barostat_config["dt"],
                     )
                 else:
-                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")
+                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")  # noqa: TRY002
 
                 rollout_loss = 0
                 for step in range(rollout_steps):
@@ -199,7 +198,7 @@ def train_model_once_mst(
                     if isinstance(function_output, torch.Tensor):
                         pred_graph_next.edge_attr = function_output
 
-                    elif isinstance(function_output, Tuple):
+                    elif isinstance(function_output, tuple):
                         edge_index, edge_attr = function_output
                         pred_graph_next.edge_index = edge_index
                         pred_graph_next.edge_attr = edge_attr
@@ -333,7 +332,7 @@ if __name__ == "__main__":
 
     max_sim_len = 200
     logger.info(f"Loading data with maximum sim lengths {max_sim_len}.")
-    for key in data.keys():
+    for key in data:
         if key == "train":
             data[key] = [
                 torch.load(file, weights_only=False)[:max_sim_len]

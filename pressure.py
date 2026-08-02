@@ -148,48 +148,6 @@ def compute_total_stress(graph: Data, r0: Tensor, temperature: float = 1e-7):
     return torch.stack([p_v_xx + p_kinetic, p_v_yy + p_kinetic])
 
 
-# def compute_per_particle_forces(graph: Data, r0: Tensor, panic_at_nontensor_box: bool = True) -> Tensor:
-#     pos = graph.x
-
-#     if hasattr(graph, "box_tensor") and isinstance(graph.box_tensor, Tensor):
-#         box_size = graph.box_tensor
-#     else:
-#         if panic_at_nontensor_box:
-#             raise AttributeError("Graph does not have a tensor with box info.")
-#         else:
-#             box_size = torch.tensor([graph.box.x, graph.box.y], device=pos.device, dtype=pos.dtype)
-
-#     edge_index = graph.edge_index
-#     stiffness = graph.edge_attr[:, -1]
-
-#     if is_undirected(edge_index):
-#         sources, targets = edge_index[0], edge_index[1]
-#         edge_stiffness = stiffness
-#     else:
-#         sources = torch.cat([edge_index[0], edge_index[1]])
-#         targets = torch.cat([edge_index[1], edge_index[0]])
-#         edge_stiffness = torch.cat([stiffness, stiffness])
-
-#     source_pos = pos[sources]
-#     target_pos = pos[targets]
-#     vecs = target_pos - source_pos
-
-#     half_box = box_size * 0.5
-#     vecs = torch.where(vecs > half_box, vecs - box_size, vecs)
-#     vecs = torch.where(vecs <= -half_box, vecs + box_size, vecs)
-
-#     lengths = torch.norm(vecs, dim=1)
-
-#     unit_vecs = vecs / lengths.unsqueeze(1)
-
-#     force_magnitudes = -edge_stiffness * (lengths - r0)
-#     force_vectors = force_magnitudes.unsqueeze(1) * unit_vecs
-
-#     forces = torch.zeros_like(pos).index_add(0, targets, force_vectors)
-
-#     return forces
-
-
 def compute_per_particle_forces(graph: Data, r0: Tensor | None, cutoff: float | None = 1.122, panic_at_nontensor_box: bool = True) -> Tensor:
     """Computes forces for both old and new format.
 
@@ -372,5 +330,3 @@ def compute_stress_curve(trajectory: list[Data], lj_cutoff: float | None = 1.122
         )
         curve.append(step_stress.to(device))
     return torch.stack(curve)
-
-

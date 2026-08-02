@@ -39,7 +39,7 @@ def add_spaces(string: str, width: int, indent: str = "right") -> str:
     elif indent == "left":
         return string + spaces_to_add
     else:
-        raise IOError(f" [ERROR] {indent} is not a valid indent type. Only 'right' and 'left' are supported.")
+        raise OSError(f" [ERROR] {indent} is not a valid indent type. Only 'right' and 'left' are supported.")
 
 
 class Atom:
@@ -77,15 +77,7 @@ class Atom:
         return f"Atom {self.atom_id} : {self.x}, {self.y}, {self.z})."
 
     def __eq__(self, other: Atom) -> bool:
-        if (
-            self.atom_id == other.atom_id
-            and self.diameter == other.diameter
-            and self.x == other.x
-            and self.y == other.y
-            and self.z == other.z
-        ):
-            return True
-        return False
+        return bool(self.atom_id == other.atom_id and self.diameter == other.diameter and self.x == other.x and self.y == other.y and self.z == other.z)
 
     def __hash__(self) -> int:
         return hash((self.atom_id, self.x, self.y, self.z))
@@ -112,14 +104,7 @@ class Atom:
         y_min, y_max = min(box.y1, box.y2), max(box.y1, box.y2)
         z_min, z_max = min(box.z1, box.z2), max(box.z1, box.z2)
 
-        if (
-            x_min <= self.x <= x_max
-            and y_min <= self.y <= y_max
-            and z_min <= self.z <= z_max
-        ):
-            return True
-
-        return False
+        return bool(x_min <= self.x <= x_max and y_min <= self.y <= y_max and z_min <= self.z <= z_max)
 
     def on_edge(self, box: Box, delta: float) -> bool:
         delta_x = delta_y = delta_z = delta
@@ -147,10 +132,7 @@ class Atom:
             box.z2 + delta_z,
         )
 
-        if self.within_box(bigger_box) and not self.within_box(smaller_box):
-            return True
-        else:
-            return False
+        return bool(self.within_box(bigger_box) and not self.within_box(smaller_box))
 
 
 class Bond:
@@ -180,7 +162,7 @@ class Bond:
          coeff: {self.bond_coefficient})"""
 
     def __eq__(self, other: Bond) -> bool:
-        if {self.atom1, self.atom2} == {other.atom1, other.atom2}:
+        if {self.atom1, self.atom2} == {other.atom1, other.atom2}:  # noqa: SIM102
             if round(self.length, 6) == round(other.length, 6):
                 return True
         return False
@@ -265,9 +247,7 @@ class Angle:
             self.value = value
 
     def __eq__(self, other: Angle) -> bool:
-        if self.value == other.value:
-            return True
-        return False
+        return self.value == other.value
 
     def __hash__(self) -> int:
         if self.atom1.atom_id > self.atom3.atom_id:
@@ -312,15 +292,21 @@ class Header:
         atoms: list[Atom],
         bonds: list[Bond],
         box: Box,
-        angles: list = [],
-        dihedrals: list = [],
-        impropers: list = [],
+        angles: list | None = None,
+        dihedrals: list | None = None,
+        impropers: list | None = None,
         atom_types: int = 1,  # defaults to one
         bond_types: int = 0,
         angle_types: int = 0,
         dihedral_types: int = 0,
         improper_types: int = 0,
     ):
+        if impropers is None:
+            impropers = []
+        if dihedrals is None:
+            dihedrals = []
+        if angles is None:
+            angles = []
         self.box_dimensions = box.dimensions
         self.atoms = len(atoms)
         self.bonds = len(bonds) if bonds else 0
@@ -423,8 +409,8 @@ class Box:
 
         for index, line in enumerate(content):
             if "xlo" in line:
-                x1 = float(content[index].split()[0])
-                x2 = float(content[index].split()[1])
+                x1 = float(line.split()[0])
+                x2 = float(line.split()[1])
                 y1 = float(content[index + 1].split()[0])
                 y2 = float(content[index + 1].split()[1])
                 z1 = float(content[index + 2].split()[0])
@@ -594,7 +580,7 @@ class Network:
             for angle in self.angles:
                 angle.energy = value
         else:
-            raise Exception("No angle data present")
+            raise Exception("No angle data present")  # noqa: TRY002
 
 
     def set_source_target(
@@ -624,7 +610,7 @@ class Network:
         atoms_map[target_beads[1]].atom_type = 3
         self.masses[3] = target_beads_mass
         # fix header
-        n_atom_types: int = len(set([atom.atom_type for atom in self.atoms]))
+        n_atom_types: int = len({atom.atom_type for atom in self.atoms})
         self.header.atom_types = n_atom_types
         self.masses = {1: 1.0, 2: source_beads_mass, 3: target_beads_mass}
 
@@ -744,13 +730,13 @@ class Network:
         dihedrals = []  # noqa: F841
 
         location: dict[str, tuple[int | None, ...]] = {
-            "atoms": tuple(),
-            "bonds": tuple(),
-            "angles": tuple(),
-            "dihedrals": tuple(),
-            "masses": tuple(),
-            "bond_coeffs": tuple(),
-            "angle_coeffs" : tuple(),
+            "atoms": (),
+            "bonds": (),
+            "angles": (),
+            "dihedrals": (),
+            "masses": (),
+            "bond_coeffs": (),
+            "angle_coeffs" : (),
         }
         atoms_start      : int | None = None
         atoms_end        : int | None = None
@@ -1154,7 +1140,7 @@ if __name__ == "__main__":
         input_file_path = os.path.abspath(input_file_path)
         input_dir = os.path.dirname(input_file_path)
         input_file_name = os.path.basename(input_file_path).split(".")[0]
-        out_file_name = "".join((input_file_name, "_out.lmp"))
+        out_file_name = f"{input_file_name}_out.lmp"
         out_file_path = os.path.join(input_dir, out_file_name)
 
     # constructing the bare minimum network from atomic coordinates

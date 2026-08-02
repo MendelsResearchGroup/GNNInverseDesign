@@ -2,7 +2,6 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List
 
 import torch
 from sklearn.metrics import r2_score
@@ -30,13 +29,13 @@ from utils import (
 
 
 def train_model_once_mst(
-    data: dict[str, List],
+    data: dict[str, list],
     model: VelocityModel,
     epochs: int,
-    barostat_config: Dict,
+    barostat_config: dict,
     save_dir: str,
     device: str,
-) -> Dict:
+) -> dict:
 
     freeze_norm_epoch = 5
     train_sims = 200
@@ -133,7 +132,7 @@ def train_model_once_mst(
                         dump_period * barostat_config["dt"],
                     )
                 else:
-                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")
+                    raise Exception(f"Window size is too small : {len(current_window_graphs)}")  # noqa: TRY002
 
                 rollout_loss = 0
                 for step in range(rollout_steps):
@@ -319,7 +318,7 @@ if __name__ == "__main__":
 
     stride = 5
     logger.info(f"Loading data with additional stride of {stride}.")
-    for key in data.keys():
+    for key in data:
         if key == "train":
             data[key] = [
                 torch.load(file, weights_only=False)[::stride]

@@ -4,9 +4,9 @@ from torch.nn import ModuleList
 from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 
+from graph_utils import get_correct_edge_vec
 from training_utils import ModelInputs
 from utils import build_mlp
-from graph_utils import get_correct_edge_vec
 
 
 class AxisSharedNodeEncoder(torch.nn.Module):
@@ -21,24 +21,21 @@ class AxisSharedNodeEncoder(torch.nn.Module):
 
     def __init__(self, num_history_steps: int, hidden_dim: int, num_mlp: int):
         super().__init__()
-        # This MLP learns the temporal dynamics (history -> embedding)
-        # It is blind to whether it is processing X or Y.
         self.axis_mlp = build_mlp(num_history_steps, hidden_dim, hidden_dim, num_mlp=num_mlp, lay_norm=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        # x shape: [Batch, 2 * History]
 
-        # 1. Reshape to separate Space (2) from Time (History)
+        # Reshape to separate Space (2) from Time (History)
         # Shape: [Batch, 2, History]
         x_reshaped = x.view(x.size(0), 2, -1)
 
-        # 2. Apply MLP.
+        # Apply MLP.
         # Since 'History' is the last dimension, the Linear layers inside axis_mlp
         # slide over the '2' dimension, applying the same weights to both.
         # Output Shape: [Batch, 2, Hidden_Dim]
         encoded = self.axis_mlp(x_reshaped)
 
-        # 3. Flatten back so the rest of the GNN can handle it
+        # Flatten back so the rest of the GNN can handle it
         # Output Shape: [Batch, 2 * Hidden_Dim]
         return encoded.view(x.size(0), -1)
 
@@ -66,11 +63,10 @@ class Encoder(torch.nn.Module):
         )
 
     def forward(self, data: Data) -> Data:
-        # 1. Apply the Axis-Shared Encoder
-        # This ensures X and Y histories are treated identically
+        # Apply the Axis-Shared Encoder
         shared_features = self.shared_node_encoder(data.x)
 
-        # 2. Mix them together for the GNN
+        # Mix them together for the GNN
         x_encoded = self.node_projection(shared_features)
 
         return Data(
@@ -84,7 +80,7 @@ class Encoder(torch.nn.Module):
 
 class CustomMessagePassing(MessagePassing):
     def __init__(self, hidden_size: int, num_mlp: int):
-        super(CustomMessagePassing, self).__init__(aggr="add")
+        super().__init__(aggr="add")
         self.node_layer = build_mlp(hidden_size * 4, hidden_size, hidden_size, num_mlp=num_mlp, lay_norm=True)
         self.edge_layer = build_mlp(
             hidden_size * 3,
@@ -133,16 +129,10 @@ class Normalizer(torch.nn.Module):
         std_epsilon: float = 1e-8,
         name="Normalizer",
     ):
-        super(Normalizer, self).__init__()
+        super().__init__()
         self.frozen = False
         self.name = name
         self._max_accumulations = max_accumulations
-
-        # self._std_epsilon = torch.tensor(std_epsilon, dtype=torch.float, requires_grad=False, device=device)
-        # self._acc_count = torch.tensor(0, dtype=torch.float, requires_grad=False, device=device)
-        # self._num_accumulations = torch.tensor(0, dtype=torch.float, requires_grad=False, device=device)
-        # self._acc_sum = torch.zeros((1, size), dtype=torch.float, requires_grad=False, device=device)
-        # self._acc_sum_squared = torch.zeros((1, size), dtype=torch.float, requires_grad=False, device=device)
 
         self.register_buffer("_std_epsilon", torch.tensor(std_epsilon, dtype=torch.float))
         self.register_buffer("_acc_count", torch.tensor(0, dtype=torch.float))
@@ -152,9 +142,8 @@ class Normalizer(torch.nn.Module):
 
     def forward(self, data: Tensor, accumulate=True, is_training: bool = True):
         """Normalizes input data and accumulates statistics."""
-        if accumulate and is_training and not self.frozen:
-            if self._num_accumulations < self._max_accumulations:
-                self._accumulate(data.detach())
+        if accumulate and is_training and not self.frozen and self._num_accumulations < self._max_accumulations:
+            self._accumulate(data.detach())
         return (data - self._mean()) / self._std_with_epsilon()
 
     def inverse(self, normalized_batch_data: Tensor):
@@ -269,20 +258,6 @@ class Model(torch.nn.Module):
             box_tensor=inputs.cur_graph.box_tensor if hasattr(inputs.cur_graph, "box_tensor") else None,
         )
 
-        # new_edge_attr = inputs.cur_graph.edge_attr
-        # if recalc_edges:
-        #     new_edge_attr = self._recalc_edges(tmp)
-
-        # return Data(
-        #     x=predicted_position,
-        #     pos=predicted_position,
-        #     edge_index=inputs.cur_graph.edge_index,
-        #     edge_attr=new_edge_attr,
-        #     box=inputs.cur_graph.box if hasattr(inputs.cur_graph, "box") else None,
-        #     box_tensor=inputs.cur_graph.box_tensor
-        #     if hasattr(inputs.cur_graph, "box_tensor")
-        #     else None,
-        # )
 
     def velocity_update(self, inputs: ModelInputs, model_output: Tensor) -> Data:
         predicted_displacement = model_output
@@ -340,14 +315,12 @@ class Model(torch.nn.Module):
         torch.save(to_save, savedir)
 
     def load_checkpoint(self, ckpdir: str):
-        # 1. ALWAYS use map_location to prevent CPU/GPU initialization crashes
         dicts = torch.load(ckpdir, map_location=self.device, weights_only=False)
 
-        # 2. Check if this is a LEGACY checkpoint (contains your custom dictionary keys)
+        # Check if this is a legacy checkpoint (contains custom dictionary keys)
         if "model" in dicts and "output_normalizer" in dicts:
             
             # Load the main model weights. 
-            # strict=False is REQUIRED because the old state_dict won't have the normalizer buffers
             self.load_state_dict(dicts["model"], strict=False)
 
             # Manually inject the legacy normalizer states into the new buffers
@@ -372,21 +345,7 @@ class Model(torch.nn.Module):
                                 
             print(f"Successfully loaded and migrated LEGACY checkpoint from {ckpdir}")
 
-        # 3. Handle NEW standard PyTorch checkpoints (for the future)
+        # Handle new standard PyTorch checkpoints (for the future)
         else:
             self.load_state_dict(dicts)
             print(f"Successfully loaded STANDARD checkpoint from {ckpdir}")
-
-    # def load_checkpoint(self, ckpdir: str):
-    #     # dicts = torch.load(ckpdir, weights_only=False)
-    #     dicts = torch.load(ckpdir, map_location=self.device, weights_only=False)
-    #     self.load_state_dict(dicts["model"])
-
-    #     keys = list(dicts.keys())
-    #     keys.remove("model")
-
-    #     for k in keys:
-    #         v = dicts[k]
-    #         for para, value in v.items():
-    #             object = eval("self." + k)
-    #             setattr(object, para, value)

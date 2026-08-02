@@ -3,7 +3,6 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -119,17 +118,17 @@ def plot_try_distributions(
     plot_path = os.path.join(save_dir, f"try_{try_num}_distributions.png")
     plt.savefig(plot_path, dpi=300)
     plt.close()
-    logging.info(f"Saved distribution histogram to {plot_path}")
+    logging.info(f"Saved distribution histogram to {plot_path}")  # noqa: LOG015
 
 
 def train_model_once_mst(
-    data: dict[str, List],
+    data: dict[str, list],
     model: VelocityModel,
     epochs: int,
-    barostat_config: Dict,
+    barostat_config: dict,
     save_dir: str,
     device: str = "cuda",
-) -> Dict:
+) -> dict:
 
     freeze_norm_epoch = 5
     train_limit = 10
@@ -214,9 +213,7 @@ def train_model_once_mst(
                         dump_period * barostat_config["dt"],
                     )
                 else:
-                    raise Exception(
-                        f"Window size is too small : {len(current_window_graphs)}"
-                    )
+                    raise Exception(f"Window size is too small : {len(current_window_graphs)}") # noqa: TRY002
 
                 rollout_loss = 0
                 for step in range(rollout_steps):
@@ -362,13 +359,13 @@ def train_model_once_mst(
 
 
 def train_model_once_ost(
-    data: dict[str, List],
+    data: dict[str, list],
     gnn_simulator: VelocityModel,
     epochs: int,
-    barostat_config: Dict,
+    barostat_config: dict,
     save_dir: str,
     device: str = "cuda",
-) -> Dict:
+) -> dict:
 
     freeze_norm_epoch = 5
     train_limit = 15
