@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import torch
 from torch import Tensor
 from torch_geometric.data import Data
@@ -15,9 +13,10 @@ def update_box_y_thermodynamic(
     W_y: float,
     damping: float,
     stride_dt: float,
+    lj_cutoff: float | None = None,
     target_pressure: float = 0.0,
     temperature: float = 1e-7,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     
     # LAMMPS simulation was done in metal units
     KB_METAL = 8.6173303e-5  # Boltzmann constant in eV/K
@@ -37,11 +36,42 @@ def update_box_y_thermodynamic(
     dx = dx - lx * torch.round(dx / lx)
 
     dist = torch.norm(torch.stack([dx, dy], dim=1), dim=1)
-    stiffness = edge_attr[:, -1] # stiffness should always be edge_attr[:, -1]
-    device = stiffness.device
 
-    # Force calculation: -2.0 * k * (r - r0)
-    force_mag = -2.0 * stiffness * (dist - r0.to(device))
+    num_features = edge_attr.shape[1]
+
+    if num_features == 4: # Old format of edge features [vs, vy, length, stiffness]
+        stiffness = edge_attr[:, -1] # stiffness should always be edge_attr[:, -1]
+        device = stiffness.device
+
+        # Force calculation: -2.0 * k * (r - r0)
+        force_mag = -2.0 * stiffness * (dist - r0.to(device))
+
+    elif num_features == 7: # New format
+        is_harmonic = edge_attr[:, 0].bool()
+
+        # harmonic bonds parameters
+        k = edge_attr[:, 5]
+        r0 = edge_attr[:, 6]
+        
+        # LJ interactions parameters
+        epsilon = edge_attr[:, 5]
+        sigma = edge_attr[:, 6]
+
+        # Harmonic Forces
+        f_harm = -2.0 * k * (dist - r0)
+
+        # Lennard-Jones Forces
+        safe_dist = torch.where(dist < 1e-6, torch.ones_like(dist), dist)
+        sr6 = (sigma / safe_dist) ** 6
+        sr12 = sr6 ** 2
+        f_lj = (24.0 * epsilon / safe_dist) * (2.0 * sr12 - sr6)
+        f_lj = torch.where(safe_dist < lj_cutoff, f_lj, torch.zeros_like(f_lj))
+        
+        # 3. Apply routing
+        force_mag = torch.where(is_harmonic, f_harm, f_lj)
+    
+    else:
+        raise ValueError()
 
     # Virial contribution: F_y * r_y
     virial_term = force_mag * (dy**2) / (dist + 1e-12)
@@ -50,7 +80,7 @@ def update_box_y_thermodynamic(
     virial_sum_y = 0.5 * torch.sum(virial_term)
 
     # For 2D systems: Total KE = N * kB * T; Y-component is 0.5 * Total KE
-    kinetic_pressure_val = (0.5 * num_particles * KB_METAL * temperature) / (volume + 1e-12) # maybe not 1/2?
+    kinetic_pressure_val = (0.5 * num_particles * KB_METAL * temperature) / (volume + 1e-12)
 
     # Total pressure
     virial_pressure_val = virial_sum_y / (volume + 1e-12)
@@ -68,8 +98,7 @@ def update_box_y_thermodynamic(
     # Integration
     new_box_vel_y = box_vel_y + box_acc * stride_dt
 
-    # L_new = L_old * exp(v * dt)
-    # new_ly = ly * torch.exp(new_box_vel_y * stride_dt)
+    # L_new = L_old + (v * dt)
     new_ly = ly + (new_box_vel_y * stride_dt)
 
     return new_ly, new_box_vel_y
