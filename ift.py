@@ -276,7 +276,7 @@ class ImplicitPhysicsRefinement(torch.autograd.Function):
             # The negatives cancel out:
             implicit_gradient = inverse_hvp * (2.0 / N)
 
-        return implicit_gradient, None, None, None, None, None, None, None
+        return implicit_gradient, None, None, None, None, None, None, None, None
 
 
 def physical_inference_step_implicit(
@@ -388,7 +388,7 @@ def specialized_rollout_implicit(
     # Bootstrap with torch_simulator64
     starting_graph = to_f64(starting_graph).to(device)
     simulator: DifferentiableCompression64 = DifferentiableCompression64(
-        starting_graph.num_nodes, factor_two=True, temp_langevin=0.0, lj_params=lj_params,
+        starting_graph.num_nodes, temp_langevin=0.0, lj_params=lj_params,
     )
     simulator_rollout, _conditions = simulator.run_simulator(
         starting_graph,
@@ -495,5 +495,64 @@ def no_bootstrap_rollout_implicit(
         )
 
         rollout.append(predicted_graph.cpu().detach())
+
+    return rollout
+
+
+def specialized_rollout_cascade_implicit(
+    starting_graph: Data,
+    gnn_models: list[GNNModel],
+    barostat_config: dict,
+    box_delta_x: float,
+    lj_params: LJInteractionParams | None,
+    itpo_weights: ITPOWeights,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> list[Data]:
+    """Cascade rollout with ITPO refinement differentiated through the IFT.
+    """
+    for m in gnn_models:
+        m.eval()
+
+    r0 = starting_graph.edge_attr[:, -2]
+
+    rollout = [starting_graph.to(device)]
+
+    # No history exists at the start, so there is nothing to estimate the box
+    # velocity from; the barostat starts from rest exactly as in rollout_cascade.
+    current_box_vel_y = torch.zeros((), dtype=starting_graph.box_tensor.dtype, device=rollout[0].box_tensor.device)
+
+    for _ in range(rollout_steps):
+        # Pick the cascade model with history matching the number of available frames.
+        history_len = len(rollout)
+        if history_len <= len(gnn_models):
+            active_model_idx = history_len - 1
+        else:
+            active_model_idx = len(gnn_models) - 1
+        active_model = gnn_models[active_model_idx]
+
+        input_graph = build_velocity_graph_correction(
+            rollout[-len(gnn_models) :],
+            panic_at_positions=False,
+            total_velocity=False,
+        ).to(device)
+
+        prev_graph = rollout[-2] if history_len > 1 else rollout[-1]
+        curr_graph = rollout[-1]
+        model_inputs = ModelInputs(prev_graph, curr_graph, None)
+
+        predicted_graph, current_box_vel_y = physical_inference_step_implicit(
+            model=active_model,
+            input_graph=input_graph,
+            model_inputs=model_inputs,
+            barostat_config=barostat_config,
+            box_delta_x=box_delta_x,
+            r0=r0,
+            lj_params=lj_params,
+            current_box_vel_y=current_box_vel_y,
+            itpo_weights=itpo_weights,
+        )
+
+        rollout.append(predicted_graph)
 
     return rollout
