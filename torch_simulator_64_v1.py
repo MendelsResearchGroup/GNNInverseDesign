@@ -20,7 +20,6 @@ class DifferentiableCompression64(nn.Module):
         srate: float = 1.0e-5,
         temp_langevin: float = 1.0e-7,
         inertia_prefactor: float = 1.0,
-        factor_two: bool = True,
     ):
         super().__init__()
         self.mass = mass
@@ -36,17 +35,8 @@ class DifferentiableCompression64(nn.Module):
         self.kb_metal = 8.6173303e-5
         self.mvv2e = 1.0364269e-4
 
-        if factor_two:
-            # dof_factor = (2.0 * num_particles) + 2
-            dof_factor = (2.0 * num_particles) - 3
-            self.W_y = (
-                dof_factor * inertia_prefactor * self.kb_metal * self.ptemp * (pdamp**2)
-            )
-        else:
-            dof_factor = num_particles + 1
-            self.W_y = (
-                dof_factor * inertia_prefactor * self.kb_metal * self.ptemp * (pdamp**2)
-            )
+        dof_factor = (2.0 * num_particles) - 3
+        self.W_y = dof_factor * inertia_prefactor * self.kb_metal * self.ptemp * (pdamp**2)
 
         self.target_p_raw = target_p
         self.temp_langevin = temp_langevin

@@ -286,7 +286,7 @@ def physical_inference_step_implicit(
     barostat_config: dict,
     box_delta_x: float,
     r0: Tensor,
-    lj_params: LJInteractionParams,
+    lj_params: LJInteractionParams | None,
     current_box_vel_y: Tensor,
     itpo_weights: ITPOWeights,
 ) -> tuple[Data, Tensor]:
@@ -452,7 +452,7 @@ def no_bootstrap_rollout_implicit(
     gnn_simulator: GNNModel,
     gnn_history: int,
     barostat_config: dict,
-    lj_params: LJInteractionParams,
+    lj_params: LJInteractionParams | None,
     itpo_weights: ITPOWeights,
     rollout_steps: int,
     device: str = "cuda",

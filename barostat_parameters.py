@@ -59,6 +59,25 @@ node_optimizated = {
     "target_pressure": 0.0,
 }
 
+# {'C_coupling': 0.014742184359043526, 'damping_factor': 0.014416163626419677}
+alex_highT = {
+    "dt": 0.01,
+    "default_skip": 1500,
+    "C_coupling": 0.014742184359043526,
+    "damping": 0.014416163626419677,
+    "temperature": None,
+    "target_pressure": 0.0,
+}
+# {'C_coupling': 0.016555340119218116, 'damping_factor': 0.016184648289947097}
+highT = {
+    "dt": 0.01,
+    "default_skip": 200,
+    "C_coupling": 0.016555340119218116,
+    "damping": 0.016184648289947097,
+    "temperature": None,
+    "target_pressure": 0.0,
+}
+
 # {'C_coupling': 0.6021955342147184, 'damping_factor': 0.03126077864544203}
 noisy = {
     "dt": 0.01,

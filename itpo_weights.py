@@ -12,7 +12,9 @@ class DatasetType(Enum):
     StiffOptimized = auto()
     Noisy = auto()
     LJNoisy = auto()
+    LJNoisyLong = auto()
     StiffAngles = auto()
+    HighT = auto()
 
     def __str__(self):
         mapping = {
@@ -20,7 +22,9 @@ class DatasetType(Enum):
             DatasetType.StiffOptimized: "stiff_optimized",
             DatasetType.Noisy: "noisy",
             DatasetType.LJNoisy: "lj_noisy",
+            DatasetType.LJNoisyLong: "lj_noisy_long",
             DatasetType.StiffAngles: "stiff_with_angles",
+            DatasetType.HighT: "high_temperature",
         }
         return mapping[self]
 
@@ -54,24 +58,6 @@ params = {
         1e-8,
         1e-8,
     ),
-    # (ModelType.GNNModel, DatasetType.NodeOptimized): ITPOWeights(
-    #     20,
-    #     9.790375237417396e-06,
-    #     0.0005658108853271458,
-    #     1.9600958725034293e-05,
-    #     1.9624485960300745e-05,
-    #     1e-8,
-    #     1e-8,
-    # ),
-    # (ModelType.GNNModel, DatasetType.NodeOptimized): ITPOWeights(
-    #     20,
-    #     0.00015504027469938548,
-    #     0.0002699303531197999,
-    #     1.2370867946366173e-05,
-    #     1.8146185972221193e-05,
-    #     1e-8,
-    #     1e-8,
-    # ),
     (ModelType.GNNModel, DatasetType.NodeOptimized): ITPOWeights(
         30,
         2.5703244417508413e-05,
@@ -81,15 +67,6 @@ params = {
         1e-8,
         1e-8,
     ),
-    # (ModelType.GNNModel, DatasetType.StiffOptimized): ITPOWeights(
-    #     19,
-    #     1.9105108674549167e-06,
-    #     0.0001583573157398282,
-    #     2.3068090072225652e-05,
-    #     1.6904617560078452e-07,
-    #     1e-8,
-    #     1e-8,
-    # ),
     (ModelType.GNNModel, DatasetType.StiffOptimized): ITPOWeights(
         20,
         8.271896707246153e-07,
@@ -99,27 +76,6 @@ params = {
         1e-8,
         1e-8,
     ),
-    # Best Trial:
-#   R2 Score: 0.8859851140165069
-    # lr: 1.5131242389504014e-08
-    # lambda_force: 1.763471342880714e-07
-    # lambda_energy: 1.5211493976288843e-08
-    # lambda_pressure: 1.3328025107447722e-05
-    # (ModelType.GNNModel, DatasetType.LJNoisy): ITPOWeights(
-    #     20,
-    #     1.5131242389504014e-08,
-    #     1.763471342880714e-07,
-    #     1.5211493976288843e-08,
-    #     1.3328025107447722e-05,
-    #     1e-8,
-    #     1e-8,
-    # ),
-    # R2 Score: 0.933979112410745
-    # Best Hyperparameters:
-    #     lr: 4.7879350145586726e-08
-    #     lambda_force: 6.364070794372085e-05
-    #     lambda_energy: 1.0388005646656995e-08
-    #     lambda_pressure: 2.97461694778765e-06
     (ModelType.GNNModel, DatasetType.LJNoisy): ITPOWeights(
         refinement_iterations=30,
         learning_rate=4.7879350145586726e-08,
@@ -129,12 +85,36 @@ params = {
         force_tol=1e-8,
         pressure_tol=1e-8,
     ),
+    (ModelType.GNNModel, DatasetType.LJNoisyLong): ITPOWeights(
+        refinement_iterations = 30,
+        learning_rate =   4.4036227005146560e-05,
+        lambda_force =    4.3922113961895840e-06,
+        lambda_energy =   1.1523689311519826e-08,
+        lambda_pressure = 0.0004826152072281327,
+        force_tol=1e-8,
+        pressure_tol=1e-8,
+    ),
+    # (ModelType.SimulatorCascade, DatasetType.NodeOptimized): ITPOWeights(
+    #     50,
+    #     2.4347939215508626e-06,
+    #     0.2571693753028027,
+    #     3.0716147827138016e-07,
+    #     0.000396262687255812,
+    #     1e-8,
+    #     1e-8,
+    # ),
+    
+    # Best Trial: R2 Score: 0.8874426802950278
+    #     lr: 5.183287915599958e-08
+    #     lambda_force: 9.018302326030932e-08
+    #     lambda_energy: 4.9045399766971285e-05
+    #     lambda_pressure: 5.069919022905043e-07
     (ModelType.SimulatorCascade, DatasetType.NodeOptimized): ITPOWeights(
-        50,
-        2.4347939215508626e-06,
-        0.2571693753028027,
-        3.0716147827138016e-07,
-        0.000396262687255812,
+        30,
+        5.183287915599958e-08,
+        9.018302326030932e-08,
+        4.9045399766971285e-05,
+        5.069919022905043e-07,
         1e-8,
         1e-8,
     ),

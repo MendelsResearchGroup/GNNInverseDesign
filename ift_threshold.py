@@ -379,7 +379,7 @@ def specialized_rollout_implicit_threshold(
     # Bootstrap with torch_simulator64
     starting_graph = to_f64(starting_graph).to(device)
     simulator: DifferentiableCompression64 = DifferentiableCompression64(
-        starting_graph.num_nodes, factor_two=True, temp_langevin=0.0
+        starting_graph.num_nodes, temp_langevin=0.0
     )
     simulator_rollout, _conditions = simulator.run_simulator(
         starting_graph,

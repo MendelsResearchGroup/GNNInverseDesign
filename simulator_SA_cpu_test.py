@@ -203,8 +203,8 @@ class Model(torch.nn.Module):
         self.edge_normalizer = Normalizer(size=data.num_edge_features, name="EdgeNormalizer")
         self.output_normalizer = Normalizer(size=2, name="OutputNormalizer")
         self.encoder = Encoder(data, hidden_size, num_mlp=num_mlp)
-        self.gnn_layers = ModuleList()
         self.decoder = Decoder(hidden_size, num_mlp=num_mlp)
+        self.gnn_layers = ModuleList()
         for _ in range(n_layers):
             gnn_layer = CustomMessagePassing(hidden_size, num_mlp=num_mlp)
             self.gnn_layers.append(gnn_layer)
@@ -221,7 +221,7 @@ class Model(torch.nn.Module):
             box_tensor=graph.box_tensor if hasattr(graph, "box_tensor") else None,
         )
 
-    def forward(self, data: Data, is_training: bool = True) -> torch.Tensor:
+    def forward(self, data: Data, is_training: bool = True) -> Tensor:
         data = self.normalize_graph(data, is_training=is_training)
         data = self.encoder(data)
 
@@ -336,7 +336,7 @@ class Model(torch.nn.Module):
                             current_attr = getattr(target_module, param_name)
                             
                             # If it's a registered tensor buffer, securely copy the data over
-                            if isinstance(current_attr, torch.Tensor) and isinstance(value, torch.Tensor):
+                            if isinstance(current_attr, Tensor) and isinstance(value, torch.Tensor):
                                 # Move the loaded value to the correct device before copying
                                 current_attr.copy_(value.to(self.device))
                             else:

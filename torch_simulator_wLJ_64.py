@@ -19,7 +19,6 @@ class DifferentiableCompression64(nn.Module):
         temp_langevin: float = 1.0e-7,
         inertia_prefactor: float = 1.0,
         lj_params: LJInteractionParams | None = None,
-        factor_two: bool = True,
     ):
         super().__init__()
         self.mass = mass
@@ -61,7 +60,7 @@ class DifferentiableCompression64(nn.Module):
         box_size: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor,
-        r0: Tensor,  # Step-0 rest lengths for original harmonic bonds
+        r0: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         sender, receiver = edge_index
         r_vec = pos[sender] - pos[receiver]
@@ -357,6 +356,7 @@ class DifferentiableCompression64(nn.Module):
         ftol: float = 1e-6,
         stress_tol: float = 1e-7,
         relax_box: bool = True,
+        keep_lx: bool = False,
         target_stress: float = 0.0,
         box_lr: float = 1e-2,
     ) -> Data:
@@ -399,7 +399,10 @@ class DifferentiableCompression64(nn.Module):
                 strain_y = box_lr * (stress_yy - target_stress)
                 
                 # Update box dimensions
-                new_lx = box_tensor[0] * (1.0 + strain_x)
+                if not keep_lx:
+                    new_lx = box_tensor[0] * (1.0 + strain_x)
+                else:
+                    new_lx = box_tensor[0]
                 new_ly = box_tensor[1] * (1.0 + strain_y)
                 new_box = torch.stack([new_lx, new_ly])
                 
@@ -411,15 +414,18 @@ class DifferentiableCompression64(nn.Module):
                 x = x_scaled
                 box_tensor = new_box
 
-            # Stop condition (Strictly require both force AND stress to be resolved)
             if max_f < ftol:
                 if not relax_box:
                     break
                 else:
-                    # Force the stress error to be less than 1e-5 before allowing the minimizer to exit
                     stress_error_x = torch.abs(stress_xx - target_stress)
                     stress_error_y = torch.abs(stress_yy - target_stress)
-                    if stress_error_x < stress_tol and stress_error_y < stress_tol:
+
+                    # If lx is fixed, we cannot guarantee x-stress converges, so we ignore it
+                    x_converged = keep_lx or (stress_error_x < stress_tol)
+                    y_converged = stress_error_y < stress_tol
+
+                    if x_converged and y_converged:
                         break
 
             # 2. FIRE Particle Relaxation
@@ -454,7 +460,6 @@ class DifferentiableCompression64(nn.Module):
             dtype=torch.float64
         )
         return relaxed_graph
-
 
     def run_simulator(
         self,
@@ -520,7 +525,6 @@ class DifferentiableCompression64(nn.Module):
                 print(f"Step {i:>4}, Pyy={pyy:.4e}, Kinetic={kinetic_y:.4e}, Virial={virial_y:.4e}")
 
         return trajectory, conditions
-
 
     def run_simulator_to_strain(
         self,
@@ -601,5 +605,239 @@ class DifferentiableCompression64(nn.Module):
 
         if debug and current_strain >= target_strain:
             print(f"Target strain {target_strain:.4e} achieved at step {step_idx}.")
+
+        return trajectory, conditions
+
+    def resume_compression_from_2frames(
+        self,
+        frames: list[Data],
+        N: int,
+        steps: int,
+        r0: Tensor,
+        lx_0: float | None = None,
+        debug: bool = False,
+        device: str = "cuda",
+    ) -> tuple[list[Data], list]:
+        """
+        Continues the compression simulator from a non-zero strain using a sequence of frames.
+        
+        Args:
+            frames: A list of at least two Data objects representing recent frames.
+            N: The number of MD simulation steps between frames[-2] and frames[-1].
+            target_strain: The final engineering strain to reach.
+            r0: Rest distances for the edges.
+            lx_0: Initial box length in x at strain 0. If None, it will be reverse-calculated.
+            debug: Whether to print debug info.
+            device: Device to run the simulation on.
+        """
+        if len(frames) < 2:
+            raise ValueError("At least two frames are required to deduce kinetic information (velocities).")
+                
+        prev_data = frames[-2]
+        curr_data = frames[-1]
+        
+        curr_box = curr_data.box_tensor.double()
+        prev_box = prev_data.box_tensor.double()
+        
+        dt_frames = N * self.dt
+        
+        # Estimate initial box length (lx_0) if not provided
+        if lx_0 is None:
+            # L_x(t-dt) - L_x(t) = lx_0 * srate * dt_frames
+            dlx = prev_box[0] - curr_box[0]
+            lx_0_tensor = dlx / (self.srate * dt_frames)
+        else:
+            lx_0_tensor = torch.tensor(lx_0, dtype=torch.float64, device=device)
+            
+        # Estimate current step index based on the box compression
+        # L_x(t) = lx_0 * (1 - srate * current_time)
+        current_time_est = (1.0 - (curr_box[0] / lx_0_tensor)) / self.srate
+        step_idx = int(torch.round(current_time_est / self.dt).item())
+        
+        # Estimate particle velocities using minimum image convention
+        dx = curr_data.x.double() - prev_data.x.double()
+        box_view = curr_box.view(1, 2)
+        dx = dx - torch.round(dx / box_view) * box_view  # Handle boundary crossings
+        curr_v = dx / dt_frames
+        
+        # Estimate box velocity in y
+        # L_y(t) = L_y(t-dt) * exp(box_v_y * dt_frames)
+        box_v_y = torch.log(curr_box[1] / prev_box[1]) / dt_frames
+        
+        # Initialize thermostat variables 
+        # (History is lost, but thermostats re-equilibrate very quickly, so 0 is a safe start)
+        eta_v = torch.zeros(3, device=device, dtype=torch.float64)
+        
+        curr_x = curr_data.x.double()
+        curr_graph = curr_data
+        
+        edge_index = curr_graph.edge_index
+        edge_attr = curr_graph.edge_attr.double()
+        
+        trajectory = [curr_graph]
+        conditions = []
+        
+        current_strain = self.srate * (step_idx * self.dt)
+        
+        if debug:
+            print(f"Resuming from step {step_idx} (Strain: {current_strain:.4e})")
+            print(f"Estimated lx_0: {lx_0_tensor.item():.4f}, box_v_y: {box_v_y.item():.4e}")
+
+        # Run sim loop
+        # while current_strain < target_strain:
+        for i in range(steps):
+            step_tensor = torch.tensor(step_idx, device=device, dtype=torch.int32)
+            
+            curr_x, curr_v, curr_box, box_v_y, eta_v, pyy, kinetic_y, virial_y = (
+                self.forward(
+                    curr_x,
+                    curr_v,
+                    curr_box,
+                    box_v_y,
+                    eta_v,
+                    edge_index,
+                    edge_attr,
+                    r0,
+                    step_idx=step_tensor,
+                    lx_0=lx_0_tensor,
+                )
+            )
+            curr_graph = self.update_graph_simulator(curr_graph, curr_x, curr_box)
+            
+            edge_index = curr_graph.edge_index
+            edge_attr = curr_graph.edge_attr.double()
+            
+            trajectory.append(curr_graph)
+            
+            # Update loop condition states
+            current_time = (step_idx + 1) * self.dt
+            current_strain = self.srate * current_time
+            
+            if debug:
+                print(f"Step {step_idx:>4}, Strain={current_strain:.4e}, Pyy={pyy:.4e}, Kinetic={kinetic_y:.4e}, Virial={virial_y:.4e}")
+                
+            step_idx += 1
+
+        return trajectory, conditions
+
+    def resume_compression_from_3frames(
+        self,
+        frames: list[Data],
+        N: int,
+        steps: int,
+        r0: Tensor,
+        lx_0: float | None = None,
+        debug: bool = False,
+        device: str = "cuda",
+    ) -> tuple[list[Data], list]:
+        """
+        Continues the compression simulator from a non-zero strain using 3 frames
+        to estimate instantaneous velocities via 3-point backward difference.
+        """
+        if len(frames) < 3:
+            raise ValueError("At least three frames are required for 3-point backward difference velocity estimation.")
+                
+        t_minus_2 = frames[-3]
+        t_minus_1 = frames[-2]
+        t_0 = frames[-1]
+        
+        box_minus_2 = t_minus_2.box_tensor.double()
+        box_minus_1 = t_minus_1.box_tensor.double()
+        box_0 = t_0.box_tensor.double()
+        
+        dt_frames = N * self.dt
+        
+        # Estimate initial box length (lx_0) if not provided
+        if lx_0 is None:
+            dlx = box_minus_1[0] - box_0[0]
+            lx_0_tensor = dlx / (self.srate * dt_frames)
+        else:
+            lx_0_tensor = torch.tensor(lx_0, dtype=torch.float64, device=device)
+            
+        # Estimate current step index based on the box compression
+        current_time_est = (1.0 - (box_0[0] / lx_0_tensor)) / self.srate
+        step_idx = int(torch.round(current_time_est / self.dt).item())
+        
+        # --- 3-Point Backward Difference for Velocities ---
+        x_0 = t_0.x.double()
+        x_minus_1 = t_minus_1.x.double()
+        x_minus_2 = t_minus_2.x.double()
+        
+        box_0_view = box_0.view(1, 2)
+        box_minus_1_view = box_minus_1.view(1, 2)
+        
+        # Unwrap coordinates using Minimum Image Convention backward in time
+        # 1. Displacement from t(-1) to t(0)
+        dx_1_to_0 = x_0 - x_minus_1
+        dx_1_to_0 = dx_1_to_0 - torch.round(dx_1_to_0 / box_0_view) * box_0_view
+        unwrapped_x_minus_1 = x_0 - dx_1_to_0
+        
+        # 2. Displacement from t(-2) to t(-1)
+        dx_2_to_1 = x_minus_1 - x_minus_2
+        dx_2_to_1 = dx_2_to_1 - torch.round(dx_2_to_1 / box_minus_1_view) * box_minus_1_view
+        unwrapped_x_minus_2 = unwrapped_x_minus_1 - dx_2_to_1
+        
+        # Calculate instantaneous velocity at t(0)
+        curr_v = (3.0 * x_0 - 4.0 * unwrapped_x_minus_1 + unwrapped_x_minus_2) / (2.0 * dt_frames)
+        
+        # --- 3-Point Backward Difference for Box Velocity in Y ---
+        # Box length follows L_y(t) = L_y(0) * exp(box_v_y * t). Apply BDF to log(L_y)
+        log_Ly_0 = torch.log(box_0[1])
+        log_Ly_minus_1 = torch.log(box_minus_1[1])
+        log_Ly_minus_2 = torch.log(box_minus_2[1])
+        
+        box_v_y = (3.0 * log_Ly_0 - 4.0 * log_Ly_minus_1 + log_Ly_minus_2) / (2.0 * dt_frames)
+        
+        # Initialize thermostat variables 
+        eta_v = torch.zeros(3, device=device, dtype=torch.float64)
+        
+        curr_graph = t_0
+        curr_x = t_0.x.double()
+        curr_box = t_0.box_tensor.double()
+        
+        edge_index = curr_graph.edge_index
+        edge_attr = curr_graph.edge_attr.double()
+        
+        trajectory = [curr_graph]
+        conditions = []
+        
+        current_strain = self.srate * (step_idx * self.dt)
+        
+        if debug:
+            print(f"Resuming from step {step_idx} (Strain: {current_strain:.4e})")
+            print(f"Estimated lx_0: {lx_0_tensor.item():.4f}, box_v_y: {box_v_y.item():.4e}")
+
+        # Run sim loop
+        for i in range(steps):
+            step_tensor = torch.tensor(step_idx, device=device, dtype=torch.int32)
+            
+            curr_x, curr_v, curr_box, box_v_y, eta_v, pyy, kinetic_y, virial_y = (
+                self.forward(
+                    curr_x,
+                    curr_v,
+                    curr_box,
+                    box_v_y,
+                    eta_v,
+                    edge_index,
+                    edge_attr,
+                    r0,
+                    step_idx=step_tensor,
+                    lx_0=lx_0_tensor,
+                )
+            )
+            curr_graph = self.update_graph_simulator(curr_graph, curr_x, curr_box)
+            
+            edge_index = curr_graph.edge_index
+            edge_attr = curr_graph.edge_attr.double()
+            
+            trajectory.append(curr_graph)
+            
+            current_time = (step_idx + 1) * self.dt
+            current_strain = self.srate * current_time
+            
+            if debug:
+                print(f"Step {step_idx:>4}, Strain={current_strain:.4e}, Pyy={pyy:.4e}, Kinetic={kinetic_y:.4e}, Virial={virial_y:.4e}")
+                
+            step_idx += 1
 
         return trajectory, conditions

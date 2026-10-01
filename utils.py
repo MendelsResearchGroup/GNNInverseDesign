@@ -31,42 +31,109 @@ def load_and_split_dataset(
     target_data_type: DatasetType,
     possion_buckets: list,
     split_ratios: tuple = (0.6, 0.2, 0.2),
-    seed: int = 42
+    seed: int = 42,
+    temperatures: float | list[float] | None = None,
+    per_temperature: bool = False,
+    return_temperatures: bool = False,
 ):
+    """Sample simulations from a registry csv and split them into train/val/test.
+
+    Parameters
+    ----------
+    registry_path : str
+        Path to the registry csv (`sim_id`, `poisson_ratio`, `data_type`,
+        `file_path` and, for multi-temperature datasets, `temperature`).
+    target_data_type : DatasetType
+        Only rows whose `data_type` matches `str(target_data_type)` are used.
+    possion_buckets : list
+        List of `{"min": ..., "max": ..., "count": ...}` dicts. `min` is
+        inclusive, `max` is exclusive.
+    split_ratios : tuple
+        Train/val/test fractions, must sum to 1.0.
+    seed : int
+        Seed for both the bucket sampling and the shuffling.
+    temperatures : float | list[float] | None
+        Keep only simulations run at these temperatures. `None` (default) keeps
+        every temperature, which reproduces the old behaviour. Requires a
+        `temperature` column in the registry.
+    per_temperature : bool
+        If True, the bucket `count`s are applied *within* every temperature
+        group, so each temperature contributes the same number of sims.
+        If False (default), the counts apply to the whole pool at once.
+    return_temperatures : bool
+        If True, the three returned lists hold `(file_path, temperature)` tuples
+        instead of bare paths, so the temperature can be attached to the graphs
+        while the chunks are loaded one by one.
+    """
     if sum(split_ratios) != 1.0:
         raise ValueError(f"expected `split_ratios` to sum up to 1.0, got {sum(split_ratios)}. ")
-        
+
     df = pd.read_csv(registry_path)
-    
+
     # Filter by data_type
     type_df = df[df['data_type'] == str(target_data_type)]
-    
+
     if type_df.empty:
         raise ValueError(f"No data found for data_type: {target_data_type}")
 
+    needs_temperature = (
+        temperatures is not None or per_temperature or return_temperatures
+    )
+    if needs_temperature and 'temperature' not in type_df.columns:
+        raise ValueError(
+            f"Registry {registry_path} has no 'temperature' column, "
+            "so it cannot be filtered, grouped or returned by temperature."
+        )
+
+    # Filter by temperature
+    if temperatures is not None:
+        requested = [temperatures] if isinstance(temperatures, (int, float)) else list(temperatures)
+        available = np.asarray(type_df['temperature'].to_numpy(), dtype=float)
+        mask = np.zeros(len(type_df), dtype=bool)
+        for temperature in requested:
+            hit = np.isclose(available, float(temperature))
+            if not hit.any():
+                print(f"Warning: no data found for temperature {temperature}.")
+            mask |= hit
+        type_df = type_df[mask]
+
+        if type_df.empty:
+            raise ValueError(f"No data found for temperatures: {requested}")
+
+    def sample_buckets(pool_df, label=""):
+        """Take the requested number of sims out of every Poisson's ratio bucket."""
+        sampled_dfs = []
+
+        for i, bucket in enumerate(possion_buckets):
+            p_min = bucket.get('min', float('-inf'))
+            p_max = bucket.get('max', float('inf'))
+            req_count = bucket['count']
+
+            # Filter for the specific Poisson's ratio range (inclusive min, exclusive max)
+            bucket_df = pool_df[(pool_df['poisson_ratio'] >= p_min) & (pool_df['poisson_ratio'] < p_max)]
+
+            available = len(bucket_df)
+            if available == 0:
+                print(f"Warning: Bucket {i}{label} ({p_min} <= P < {p_max}) is empty.")
+                continue
+
+            if req_count > available:
+                print(f"Warning: Bucket {i}{label} requested {req_count} but only has {available}. Taking all {available}.")
+                req_count = available
+
+            # Sample the requested amount
+            sampled = bucket_df.sample(n=req_count, random_state=seed)
+            sampled_dfs.append(sampled)
+
+        return sampled_dfs
+
+    # Process each requested bucket, either globally or once per temperature
     sampled_dfs = []
-
-    # Process each requested bucket
-    for i, bucket in enumerate(possion_buckets):
-        p_min = bucket.get('min', float('-inf'))
-        p_max = bucket.get('max', float('inf'))
-        req_count = bucket['count']
-
-        # Filter for the specific Poisson's ratio range (inclusive min, exclusive max)
-        bucket_df = type_df[(type_df['poisson_ratio'] >= p_min) & (type_df['poisson_ratio'] < p_max)]
-        
-        available = len(bucket_df)
-        if available == 0:
-            print(f"Warning: Bucket {i} ({p_min} <= P < {p_max}) is empty.")
-            continue
-            
-        if req_count > available:
-            print(f"Warning: Bucket {i} requested {req_count} but only has {available}. Taking all {available}.")
-            req_count = available
-            
-        # Sample the requested amount
-        sampled = bucket_df.sample(n=req_count, random_state=seed)
-        sampled_dfs.append(sampled)
+    if per_temperature:
+        for temperature, temperature_df in type_df.groupby('temperature'):
+            sampled_dfs += sample_buckets(temperature_df, label=f" (T = {temperature})")
+    else:
+        sampled_dfs = sample_buckets(type_df)
 
     if not sampled_dfs:
         raise ValueError("No data was sampled from any bucket. Check threshold logic.")
@@ -85,8 +152,13 @@ def load_and_split_dataset(
     val_df = combined_df.iloc[train_end:val_end]
     test_df = combined_df.iloc[val_end:]
 
-    # Extract file paths
+    # Extract file paths, optionally paired with the temperature of the sim
     def build_paths(subset_df):
+        if return_temperatures:
+            return [
+                (fname, float(temperature))
+                for fname, temperature in zip(subset_df['file_path'], subset_df['temperature'])
+            ]
         return [fname for fname in subset_df['file_path']]
 
     return build_paths(train_df), build_paths(val_df), build_paths(test_df)
@@ -864,6 +936,7 @@ def rollout_cascade(
     initial_state: Data,
     num_steps: int,
     barostat_config: dict,
+    lj_params: LJInteractionParams | None,
     box_delta_x: float,
     device: str = "cuda"
 ) -> list[Data]:
@@ -953,7 +1026,10 @@ def rollout_cascade(
             next_step_pred.box_tensor = new_box_tensor
 
             # Recompute edges
-            next_step_pred.edge_attr = get_correct_edge_attr(next_step_pred, recompute_stiff=False, panic_at_nontensor_box=True)
+            # does not work with Lj!!!
+            func_output = get_correct_edge_attr(next_step_pred, recompute_stiff=False, lj_params=lj_params, panic_at_nontensor_box=True)
+            assert func_output.shape[1] == 4
+            next_step_pred.edge_attr = func_output
 
             # Add to the rollout
             current_trajectory.append(next_step_pred.detach())
@@ -1052,7 +1128,7 @@ def physical_inference_step(
 
         # Update graph with a new box
         predicted_graph.box_tensor = new_box_tensor
-        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, lj_params=None, panic_at_nontensor_box=True)
 
         # Calculate Losses
 
@@ -1060,7 +1136,7 @@ def physical_inference_step(
         loss_anchor = torch.mean((a_refined - a_nn) ** 2)
 
         # Physics Loss
-        energy_loss, force_loss, pressure_loss = compute_combined_physics_loss(predicted_graph, r0=r0, target_Pyy=0.0)
+        energy_loss, force_loss, pressure_loss = compute_combined_physics_loss(predicted_graph, r0=r0, lj_cutoff=None, target_Pyy=0.0)
         loss_physics = (
             itpo_weights.lambda_energy * energy_loss + 
             itpo_weights.lambda_force * force_loss + 
@@ -1117,7 +1193,7 @@ def physical_inference_step(
 
         # Update graph with a new box
         predicted_graph.box_tensor = new_box_tensor
-        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+        predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, lj_params=None, panic_at_nontensor_box=True)
 
     return predicted_graph.detach(), new_vel_y.detach()
 
@@ -1219,13 +1295,16 @@ def physical_inference_step_STE(
             # Update graph with a new box
             predicted_graph.box_tensor = new_box_tensor
             predicted_graph.edge_attr = get_correct_edge_attr(
-                predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True
+                predicted_graph,
+                recompute_stiff=False,
+                lj_params=None,
+                panic_at_nontensor_box=True,
             )
 
             # Calculate Losses
             loss_anchor = torch.mean((a_refined - a_nn.detach()) ** 2)
             energy_loss, force_loss, pressure_loss = compute_combined_physics_loss(
-                predicted_graph, r0=r0_det, target_Pyy=0.0
+                predicted_graph, r0=r0_det, lj_cutoff=None, target_Pyy=0.0
             )
 
             loss_physics = (
@@ -1276,7 +1355,12 @@ def physical_inference_step_STE(
 
     # Update graph with a new box
     predicted_graph.box_tensor = new_box_tensor
-    predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, panic_at_nontensor_box=True)
+    predicted_graph.edge_attr = get_correct_edge_attr(
+        predicted_graph,
+        recompute_stiff=False,
+        lj_params=None,
+        panic_at_nontensor_box=True,
+    )
 
     return predicted_graph, new_vel_y
 
@@ -1299,7 +1383,7 @@ def specialized_rollout(
 
     # Bootstrap with torch_simulator64
     starting_graph = to_f64(starting_graph).cuda()
-    simulator: DifferentiableCompression64 = DifferentiableCompression64(starting_graph.num_nodes, factor_two=True, temp_langevin=0.0)
+    simulator: DifferentiableCompression64 = DifferentiableCompression64(starting_graph.num_nodes, temp_langevin=0.0)
     simulator_rollout, _conditions = simulator.run_simulator(
         starting_graph,
         md_steps,
@@ -1388,7 +1472,7 @@ def specialized_rollout_STE(
     # Bootstrap with torch_simulator64
     starting_graph = to_f64(starting_graph).to(device)
     simulator: DifferentiableCompression64 = DifferentiableCompression64(
-        starting_graph.num_nodes, factor_two=True, temp_langevin=0.0
+        starting_graph.num_nodes, temp_langevin=0.0
     )
     simulator_rollout, _conditions = simulator.run_simulator(
         starting_graph,
@@ -1462,6 +1546,60 @@ def specialized_rollout_STE(
     return rollout
 
 
+def no_bootstrap_rollout_STE(
+    input_graphs: list[Data],
+    gnn_simulator: GNNModel,
+    gnn_history: int,
+    barostat_config: dict,
+    itpo_weights: ITPOWeights,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> list[Data]:
+    """Roll out ITPO from an existing history using straight-through gradients.
+
+    The refined acceleration is used in the forward trajectory, while
+    ``physical_inference_step_STE`` routes its backward gradient through the
+    original GNN acceleration prediction. Unlike the inference-only rollout,
+    this function deliberately does not detach predicted states between steps.
+    """
+
+    r0 = input_graphs[0].edge_attr[:, -2]
+    default_skip = barostat_config["default_skip"]
+    dt = barostat_config["dt"]
+    stride_dt = default_skip * dt
+    rollout = list(input_graphs)
+
+    box_delta_x = input_graphs[-1].box_tensor[0] - input_graphs[-2].box_tensor[0]
+    if gnn_history >= 2:
+        current_box_vel_y = estimate_initial_box_vel_y_accurate(
+            input_graphs[-3], input_graphs[-2], input_graphs[-1], stride_dt
+        )
+    else:
+        current_box_vel_y = estimate_initial_box_vel_y(
+            input_graphs[-2], input_graphs[-1], stride_dt
+        )
+
+    for _ in range(rollout_steps + 1):
+        recent = rollout[-gnn_history - 1 :]
+        input_graph = build_velocity_graph_correction(recent).to(device)
+        model_inputs = ModelInputs(
+            rollout[-2].to(device), rollout[-1].to(device), None
+        )
+        predicted_graph, current_box_vel_y = physical_inference_step_STE(
+            model=gnn_simulator,
+            input_graph=input_graph,
+            model_inputs=model_inputs,
+            barostat_config=barostat_config,
+            box_delta_x=box_delta_x,
+            r0=r0,
+            current_box_vel_y=current_box_vel_y,
+            itpo_weights=itpo_weights,
+        )
+        rollout.append(predicted_graph)
+
+    return rollout
+
+
 def specialized_rollout_cascade(
     starting_graph: Data,
     gnn_models: list[GNNModel],
@@ -1519,6 +1657,78 @@ def specialized_rollout_cascade(
 
         rollout.append(predicted_graph.detach())
     
+    return rollout
+
+
+def specialized_rollout_cascade_STE(
+    starting_graph: Data,
+    gnn_models: list[GNNModel],
+    barostat_config: dict,
+    box_delta_x: float,
+    itpo_weights: ITPOWeights,
+    rollout_steps: int,
+    device: str = "cuda",
+) -> list[Data]:
+    """Cascade rollout with ITPO refinement and straight-through gradients.
+
+    Same trajectory as ``specialized_rollout_cascade`` -- one coarse update per
+    step, with the active cascade member chosen from how many frames exist so
+    far -- but the refinement uses ``physical_inference_step_STE``. The refined
+    acceleration drives the forward trajectory while the backward pass is routed
+    through the raw GNN prediction, and predicted states are deliberately not
+    detached between steps so the outer graph survives to the end.
+
+    Performs exactly ``rollout_steps`` coarse updates, matching
+    ``rollout_cascade(num_steps=rollout_steps)``, so the two are directly
+    comparable.
+    """
+    for m in gnn_models:
+        m.eval()
+
+    r0 = starting_graph.edge_attr[:, -2]
+
+    rollout = [starting_graph.to(device)]
+
+    # No history exists at the start, so there is nothing to estimate the box
+    # velocity from; the barostat starts from rest exactly as in rollout_cascade.
+    # It has to be a zero-dim tensor rather than a plain 0.0, because the ITPO
+    # refinement steps stash the box velocity for their backward pass.
+    current_box_vel_y = torch.zeros(
+        (), dtype=starting_graph.box_tensor.dtype, device=rollout[0].box_tensor.device
+    )
+
+    for _ in range(rollout_steps):
+        # Pick the cascade member matching the number of available frames.
+        history_len = len(rollout)
+        if history_len <= len(gnn_models):
+            active_model_idx = history_len - 1
+        else:
+            active_model_idx = len(gnn_models) - 1
+        active_model = gnn_models[active_model_idx]
+
+        input_graph = build_velocity_graph_correction(
+            rollout[-len(gnn_models) :],
+            panic_at_positions=False,
+            total_velocity=False,
+        ).to(device)
+
+        prev_graph = rollout[-2] if history_len > 1 else rollout[-1]
+        curr_graph = rollout[-1]
+        model_inputs = ModelInputs(prev_graph, curr_graph, None)
+
+        predicted_graph, current_box_vel_y = physical_inference_step_STE(
+            model=active_model,
+            input_graph=input_graph,
+            model_inputs=model_inputs,
+            barostat_config=barostat_config,
+            box_delta_x=box_delta_x,
+            r0=r0,
+            current_box_vel_y=current_box_vel_y,
+            itpo_weights=itpo_weights,
+        )
+
+        rollout.append(predicted_graph)
+
     return rollout
 
 
