@@ -53,8 +53,11 @@ COMBINED_MARGIN = 1.0
 CASCADE_ITPO_WEIGHTS = ITPOWeights(50, 2.4347939215508626e-06, 0.2571693753028027, 3.0716147827138016e-07, 0.000396262687255812, 1e-8, 1e-8)
 
 
-def next_graph(a, curr_graph, prev_graph, box_delta_x, r0, box_vel_y, barostat_config):
-    """Forward Euler + uniaxial compression + barostat, the same sequence as the ITPO closure in physical_inference_step."""
+def next_graph(a, curr_graph, prev_graph, box_delta_x, r0, box_vel_y, barostat_config, lj_params=None):
+    """Forward Euler + uniaxial compression + barostat, the same sequence as the ITPO closure in physical_inference_step.
+
+    With lj_params, the LJ edges are rebuilt for the new positions as in utils.get_rollout.
+    """
     num_particles = curr_graph.num_nodes
     stride_dt = barostat_config["default_skip"] * barostat_config["dt"]
 
@@ -71,16 +74,21 @@ def next_graph(a, curr_graph, prev_graph, box_delta_x, r0, box_vel_y, barostat_c
         W_y=barostat_config["C_coupling"] * num_particles * (stride_dt**2),
         damping=barostat_config["damping"] * num_particles * stride_dt,
         stride_dt=stride_dt,
+        lj_cutoff=lj_params.cutoff if lj_params is not None else None,
         target_pressure=barostat_config["target_pressure"],
         temperature=barostat_config["temperature"],
     )
     predicted_graph.box_tensor = torch.stack([curr_graph.box_tensor[0] + box_delta_x, compressed_ly])
-    predicted_graph.edge_attr = get_correct_edge_attr(predicted_graph, recompute_stiff=False, lj_params=None, panic_at_nontensor_box=True)
+    edges = get_correct_edge_attr(predicted_graph, recompute_stiff=False, lj_params=lj_params, panic_at_nontensor_box=True)
+    if isinstance(edges, tuple):
+        predicted_graph.edge_index, predicted_graph.edge_attr = edges
+    else:
+        predicted_graph.edge_attr = edges
 
     return predicted_graph, new_vel_y
 
 
-def constrained_rollout(models, rollout, num_steps, barostat_config, box_delta_x, box_vel_y, r0, refine, grad=False):
+def constrained_rollout(models, rollout, num_steps, barostat_config, box_delta_x, box_vel_y, r0, refine, grad=False, lj_params=None):
     """rollout_cascade with a refine(a, make_graph, r0, step) hook between the GNN and the integrator.
 
     A single bootstrapped simulator goes through the same loop as [model] * (history + 1).
@@ -92,7 +100,7 @@ def constrained_rollout(models, rollout, num_steps, barostat_config, box_delta_x
         input_graph = build_velocity_graph_correction(rollout[-len(models):], panic_at_positions=False)
         curr_graph = rollout[-1]
         prev_graph = rollout[-2] if len(rollout) > 1 else rollout[-1]
-        make_graph = partial(next_graph, curr_graph=curr_graph, prev_graph=prev_graph, box_delta_x=box_delta_x, r0=r0, box_vel_y=box_vel_y, barostat_config=barostat_config)
+        make_graph = partial(next_graph, curr_graph=curr_graph, prev_graph=prev_graph, box_delta_x=box_delta_x, r0=r0, box_vel_y=box_vel_y, barostat_config=barostat_config, lj_params=lj_params)
 
         with torch.set_grad_enabled(grad):
             a = active_model.output_normalizer.inverse(active_model(input_graph, is_training=False))
@@ -108,25 +116,34 @@ def no_refine(a, make_graph, r0, step):
     return a
 
 
-def bond_stiffness_diag(graph):
-    # Longitudinal part of the harmonic bond Hessian, summed per particle: H_ii = sum_j 2 k_ij n_ij n_ij^T
+def bond_stiffness_diag(graph, cutoff=None):
+    # Longitudinal part of the pair Hessian, summed per particle: H_ii = sum_j U''(r_ij) n_ij n_ij^T,
+    # with U'' = 2 k for harmonic bonds and, in the 7-feature LJ edge format, the LJ curvature inside the cutoff
     src, dst = graph.edge_index
     vec = graph.pos[dst] - graph.pos[src]
     vec = vec - torch.round(vec / graph.box_tensor) * graph.box_tensor
-    n = vec / vec.norm(dim=1, keepdim=True)
-    blocks = 2 * graph.edge_attr[:, -1, None, None] * n[:, :, None] * n[:, None, :]
+    r = vec.norm(dim=1, keepdim=True)
+    n = vec / r
+    if graph.edge_attr.shape[1] == 7:
+        r = r[:, 0]
+        sr6 = (graph.edge_attr[:, 6] / r) ** 6
+        lj = torch.where(r < cutoff, 24 * graph.edge_attr[:, 5] / r**2 * (26 * sr6**2 - 7 * sr6), torch.zeros_like(r))
+        curvature = torch.where(graph.edge_attr[:, 0].bool(), 2 * graph.edge_attr[:, 5], lj)
+    else:
+        curvature = 2 * graph.edge_attr[:, -1]
+    blocks = curvature[:, None, None] * n[:, :, None] * n[:, None, :]
     return torch.zeros(graph.num_nodes, 2, 2, device=blocks.device).index_add_(0, src, blocks)
 
 
-def make_refine_force(tau, sweeps=5, omega=0.5):
+def make_refine_force(tau, sweeps=5, omega=0.5, cutoff=None):
     # Jacobi projection onto |F_i| <= tau: F(x + d) ~ F - H d, so d_i = H_ii^-1 r_i removes the out-of-band residual r
     def refine(a, make_graph, r0, step):
         with torch.no_grad():
             for _ in range(sweeps):
                 predicted_graph, _ = make_graph(a)
-                forces = compute_per_particle_forces(predicted_graph, r0=r0, cutoff=None)
+                forces = compute_per_particle_forces(predicted_graph, r0=r0, cutoff=cutoff)
                 residual = forces - forces.clamp(-tau[step], tau[step])
-                a = a + omega * (torch.linalg.pinv(bond_stiffness_diag(predicted_graph)) @ residual[:, :, None])[:, :, 0]
+                a = a + omega * (torch.linalg.pinv(bond_stiffness_diag(predicted_graph, cutoff)) @ residual[:, :, None])[:, :, 0]
         return a
     return refine
 
@@ -205,19 +222,20 @@ def chain(*refines):
     return refine
 
 
-def load_sims(files, max_sim_len):
-    return [prepare_traj(torch.load(file, weights_only=False)[:max_sim_len], None, calc_angles=False) for file in tqdm(files, desc="loading")]
+def load_sims(files, max_sim_len, lj_params=None):
+    return [prepare_traj(torch.load(file, weights_only=False)[:max_sim_len], lj_params, calc_angles=False) for file in tqdm(files, desc="loading")]
 
 
-def split_files():
-    poisson_buckets = [
-        {"max": 0.1, "count": 300},             # P < 0.1
-        {"min": 0.1, "max": 0.2, "count": 100}, # 0.1 <= P < 0.2
-        {"min": 0.2, "count": 100}              # P >= 0.2
-    ]
+def split_files(registry_path="./data/data_registry.csv", data_type=DATASET_TYPE, poisson_buckets=None):
+    if poisson_buckets is None:
+        poisson_buckets = [
+            {"max": 0.1, "count": 300},             # P < 0.1
+            {"min": 0.1, "max": 0.2, "count": 100}, # 0.1 <= P < 0.2
+            {"min": 0.2, "count": 100}              # P >= 0.2
+        ]
     return load_and_split_dataset(
-        registry_path="./data/data_registry.csv",
-        target_data_type=DATASET_TYPE,
+        registry_path=registry_path,
+        target_data_type=data_type,
         possion_buckets=poisson_buckets,
         split_ratios=(0.5, 0.25, 0.25),
         seed=42,
@@ -231,10 +249,10 @@ def load_data(n_train_sims, n_test_sims, max_sim_len):
     return train_data, load_sims(test_files[:n_test_sims], max_sim_len)
 
 
-def force_envelope(sims):
+def force_envelope(sims, cutoff=None):
     # Per-frame max |F_i| over the sims; the bound is tau = margin * envelope
     return torch.stack([
-        torch.stack([compute_per_particle_forces(g, r0=sim[0].edge_attr[:, -2], cutoff=None).abs().max() for g in sim])
+        torch.stack([compute_per_particle_forces(g, r0=sim[0].edge_attr[:, -2], cutoff=cutoff).abs().max() for g in sim])
         for sim in sims
     ]).max(dim=0).values.to(DEVICE)
 
@@ -263,11 +281,11 @@ def load_bootstrapped():
     return model
 
 
-def evaluate(rollout, sim, offset, checkpoints, envelope):
+def evaluate(rollout, sim, offset, checkpoints, envelope, cutoff=None):
     """One row per checkpoint: metrics after `step` GNN steps, i.e. at frame offset + step."""
     rollout = [g.to(DEVICE) for g in rollout[: offset + checkpoints[-1] + 1]]
     r0 = sim[0].edge_attr[:, -2].to(DEVICE)
-    force_ratio = np.array([(compute_per_particle_forces(g, r0=r0, cutoff=None).abs().max() / envelope[i]).item() for i, g in enumerate(rollout)])
+    force_ratio = np.array([(compute_per_particle_forces(g, r0=r0, cutoff=cutoff).abs().max() / envelope[i]).item() for i, g in enumerate(rollout)])
     rows = []
     for step in checkpoints:
         frame = offset + step
